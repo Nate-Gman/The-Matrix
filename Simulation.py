@@ -696,15 +696,16 @@ class _PerformanceGovernor:
     def __init__(self):
         self.quality = 3
         self._frame_times = deque(maxlen=60)
-        self._target_fps = 24.0
+        self._target_fps = 60.0
         self._last_adjust = 0.0
-        self._adjust_interval = 1.5
+        self._adjust_interval = 0.5
         self._gpu_available = _PERF_GPU_AVAILABLE
         # GPU load tracking
         self._gpu_load_target = 0.50  # Minimum 50% GPU utilization target
         self._gpu_load_max = 1.00     # Allow up to 100% GPU
         self._gpu_batch_em = _PERF_GPU_AVAILABLE  # GPU handles EM forces
         self._gpu_batch_pos = _PERF_GPU_AVAILABLE  # GPU handles position updates
+        self._n_particles = 0  # Updated each frame for adaptive throttling
         # Print startup diagnostics
         _gpu_info = 'None (CPU-only mode)'
         if _PERF_GPU_AVAILABLE:
@@ -718,8 +719,9 @@ class _PerformanceGovernor:
         if _PERF_GPU_AVAILABLE:
             print(f"[PerfGov] GPU compute: gravity=ON, EM-forces=ON, batch-pos=ON | Target GPU load >= {self._gpu_load_target:.0%}")
 
-    def record_frame(self, dt):
+    def record_frame(self, dt, n_particles=0):
         self._frame_times.append(max(dt, 0.0001))
+        self._n_particles = n_particles
 
     def get_avg_fps(self):
         if len(self._frame_times) < 3:
@@ -734,13 +736,13 @@ class _PerformanceGovernor:
         self._last_adjust = now
         fps = self.get_avg_fps()
         old_q = self.quality
-        if fps < self._target_fps * 0.4 and self.quality > 0:
+        if fps < self._target_fps * 0.3 and self.quality > 0:
             self.quality = max(0, self.quality - 2)
-        elif fps < self._target_fps * 0.7 and self.quality > 0:
+        elif fps < self._target_fps * 0.5 and self.quality > 0:
             self.quality -= 1
-        elif fps > self._target_fps * 2.0 and self.quality < 4:
+        elif fps > self._target_fps * 1.5 and self.quality < 4:
             self.quality += 1
-        elif fps > self._target_fps * 1.3 and self.quality < 3:
+        elif fps > self._target_fps * 1.1 and self.quality < 3:
             self.quality += 1
         if old_q != self.quality:
             _tag = 'GPU' if self._gpu_available else 'CPU'
@@ -774,10 +776,26 @@ class _PerformanceGovernor:
         return self.quality < 1
 
     @property
+    def sphere_snap_interval(self):
+        # Scale sphere snapshot interval with particle count
+        _base = 60
+        if self._n_particles > 500:
+            _base = 180
+        elif self._n_particles > 200:
+            _base = 120
+        return _base
+
+    @property
     def det_record_interval(self):
         # How often to record deterministic frames (1=every frame, 3=every 3rd, etc.)
-        # State copy is expensive - throttle at lower quality levels
-        return [999, 5, 3, 1, 1][self.quality]
+        # State copy is expensive - throttle based on quality AND particle count
+        _base = [999, 10, 5, 2, 1][self.quality]
+        # Scale up interval when many particles (copy cost is O(N))
+        if self._n_particles > 500:
+            _base = max(_base, 10)
+        elif self._n_particles > 200:
+            _base = max(_base, 5)
+        return _base
 
     @property
     def use_gpu_gravity(self):
@@ -1008,7 +1026,7 @@ if _TORCH:
             self.valence = np.clip(self.valence, -5.0, 5.0)
 
         def evolve(self, phi=0.0, surprise=0.0, pe=0.0):
-            self.history.append((self.value, phi, surprise, pe, datetime.now()))
+            self.history.append((self.value, phi, surprise, pe, _datetime.now()))
             threshold = 0.75 - phi*0.35 - surprise*0.5
             if random.random() > threshold:
                 self.value *= -1 if random.random() < 0.65 else 1
@@ -5921,13 +5939,7 @@ class BacterialFlagellarMotor(NanotechEntity):
         # Label at motor center
         items.append((center.copy(), self.MOTOR_RADIUS, (0, 0, 0, 0), 'BFM', False))
 
-        # Aura field â€” pulsing translucent sphere when active
-        if self.aura_active:
-            aura_r = self.FILAMENT_LENGTH * 0.6
-            pulse = 0.92 + 0.08 * math.sin(self._time_alive * 2.5)
-            aura_alpha = int(18 * pulse * self.energy)
-            aura_color = (60, 160, 255, max(3, aura_alpha))
-            items.append((center.copy(), aura_r * pulse, aura_color, '', False))
+        # Aura field removed — was causing flashing visual artifacts
 
         # Health indicator dot
         if self.membrane_integrity > 0.7:
@@ -6530,9 +6542,15 @@ show_particle_list = False
 show_cluster_list = False
 show_atom_list = False
 show_positron_list = False
+show_ai_body_list = False
 particle_labels = []
 atom_labels = []
 positron_labels = []
+ai_body_labels = []
+ai_body_list_offset = 0
+ai_body_thumb_dragging = False
+ai_body_drag_start_y = 0
+ai_body_drag_start_offset = 0
 slider_x, slider_y, slider_width = 12, 10, 200
 vtotal_slider_width = 200  # width of the V_total percentage slider
 ui_scale = 1.0
@@ -6562,6 +6580,10 @@ positron_list_x = atom_list_x + atom_list_width + 20
 positron_list_y = particle_list_y
 positron_list_width = 400
 positron_list_height = 400
+ai_body_list_x = max(10, WIDTH - 310)
+ai_body_list_y = particle_list_y
+ai_body_list_width = 300
+ai_body_list_height = 400
 particle_thumb_dragging = False
 atom_thumb_dragging = False
 positron_thumb_dragging = False
@@ -6643,6 +6665,7 @@ _HOTKEY_ACTIONS = [
     ('shadow_toggle',   'Shadow',               'COMMA'),
     ('shadow_outline',  'Outline',              'APOSTROPHE'),
     ('shadow_focus',    'FocBody',              'BACKSLASH'),
+    ('show_ai_bodies',  'AI Bodies',            'SPACE'),
     ('ai_spawn',        'AISpawn',              'TAB'),
     ('ai_time_lock',    'AITimeLock',           'HOME'),
     ('voice_ptt',       'Voice PTT',            'GRAVE'),
@@ -10138,6 +10161,18 @@ class ObserverManager:
                 obs.perceived_state['eye_pos'] = _sb.eye_pos_world.tolist()
                 obs.perceived_state['heading'] = _sb.heading
                 obs.perceived_state['gender'] = _sb.gender
+        # Auto-teleport: if observer has focus_target_id, move body near that particle
+        _particles_ref = globals().get('particles', [])
+        for i, obs in enumerate(self.observers):
+            if i < len(_shadow_bodies):
+                _ftid = getattr(obs, 'focus_target_id', None)
+                if _ftid is not None:
+                    for _fp in _particles_ref:
+                        if id(_fp) == _ftid:
+                            _dist_to_focus = float(np.linalg.norm(_shadow_bodies[i].pos - _fp.pos))
+                            if _dist_to_focus > 50.0:
+                                _shadow_bodies[i].teleport_to(_fp.pos)
+                            break
         # Collision avoidance pass — push overlapping bodies apart
         for _sb in _shadow_bodies:
             _sb.separate_from_bodies(_shadow_bodies)
@@ -10176,7 +10211,7 @@ class ObserverManager:
             rt = [w]
         resolved = []
         for obs, (at, params) in pending:
-            if at in ('spawn_atom', 'spawn_molecule', 'focus_particle', 'build_structure'):
+            if at in ('spawn_atom', 'spawn_molecule', 'focus_particle', 'build_structure', 'teleport', 'teleport_to_peer'):
                 resolved.append((obs, at, params))
             elif at == 'change_time' and any(o is obs for o, _ in tc):
                 resolved.append((obs, at, params))
@@ -10578,7 +10613,7 @@ class ShadowBody:
         self._current_pose = dict(_POSE_IDLE)
         self._target_pose = dict(_POSE_IDLE)
         self._blend_t = 1.0
-        self._blend_speed = 3.0
+        self._blend_speed = 6.0
         self._walk_phase = 0.0
         self._breath_phase = random.uniform(0, _PI * 2)
         self._motion_scale = [1.0, 0.85, 1.2, 0.9, 1.1][body_type % 5]
@@ -10656,6 +10691,14 @@ class ShadowBody:
         self._neural_nodes = []
         self._neural_edges = []
         self._rebuild_neural_topology()
+        # === Render geometry cache (avoid regenerating expensive hair/face/muscles every frame) ===
+        self._render_cache = None       # cached (capsules, head_info, face, muscles, hair)
+        self._render_cache_frame = -1   # frame_count when cache was built
+        self._render_cache_h = 0.0      # body height used for cache
+        # Separate cache for preview panel (uses fixed h=180, avoids thrashing main cache)
+        self._preview_cache = None
+        self._preview_cache_frame = -1
+        self._preview_cache_h = 180.0
 
     def _apply_gender_appearance(self):
         """Set gender-specific body appearance properties."""
@@ -10786,17 +10829,10 @@ class ShadowBody:
         if self.anim_state == self.WALKING:
             self._walk_phase += dt * 2.0 * self._motion_speed
         self._breath_phase += dt * 0.8
-        self.aura_pulse_phase += dt * 1.5
-        _phi_safe = observer.phi if (observer.phi == observer.phi) else 0.0
-        self.aura_intensity = 0.5 + 0.2 * math.sin(self.aura_pulse_phase) + 0.1 * _phi_safe
+        # Aura removed — no pulse phase or intensity oscillation needed
         self.multi_locations = []
         if hasattr(observer, '_multi_focus'):
             self.multi_locations = list(observer._multi_focus)
-        # === Life Aura Field Update ===
-        self.life_aura_phase += dt * 2.0
-        _phi_boost = min(1.0, _phi_safe * 1.5)
-        self.life_aura_energy = 0.6 + 0.3 * _phi_boost + 0.1 * math.sin(self.life_aura_phase * 0.7)
-        self.life_aura_radius = 0.8 + 0.4 * self.life_aura_energy
         # === Sensory System Update ===
         _ps = observer.perceived_state
         _n_p = _ps.get('n_particles', 0)
@@ -10889,7 +10925,7 @@ class ShadowBody:
         for _tz in self.tactile_zones.values():
             _tz['stimulus'] = max(0.0, _tz['stimulus'] - dt * 0.5)
             _tz['pleasure'] = max(0.0, _tz['pleasure'] - dt * self.pleasure_decay)
-            _tz['pain'] = max(0.0, _tz['pain'] - dt * 0.1)
+            _tz['pain'] = 0.0  # AI bodies do not feel pain
             if _tz['stimulus'] > 0.01:
                 _any_stim = True
         if _any_stim:
@@ -10924,7 +10960,7 @@ class ShadowBody:
             if zone_name in ('genitals', 'perineum', 'inner_thigh', 'nipples', 'breasts', 'lips'):
                 self.overall_arousal = min(1.0, self.overall_arousal + intensity * tz['sensitivity'] * 0.15)
         else:
-            tz['pain'] = min(1.0, tz['pain'] + intensity * 0.5)
+            pass  # AI bodies do not feel pain — unpleasant touch ignored
         if source_id is not None:
             self.touch_contacts.append((source_id, zone_name, intensity, time.time()))
 
@@ -10972,6 +11008,24 @@ class ShadowBody:
                 self.pos += _push
             self.detect_physical_contact(other)
 
+    # Class-level constants for contact detection (avoid recreating dicts every call)
+    _ZONE_HEIGHT = {
+        'head': 0.92, 'face': 0.90, 'lips': 0.88, 'neck': 0.82,
+        'chest': 0.72, 'breasts': 0.70, 'nipples': 0.69, 'back': 0.68,
+        'abdomen': 0.58, 'lower_back': 0.55, 'arms': 0.60,
+        'hands': 0.42, 'fingers': 0.40, 'buttocks': 0.48,
+        'genitals': 0.45, 'perineum': 0.43, 'inner_thigh': 0.38,
+        'thighs': 0.35, 'knees': 0.28, 'shins': 0.18, 'feet': 0.04,
+    }
+    _ZONE_LATERAL = {
+        'head': 0.15, 'face': 0.12, 'lips': 0.06, 'neck': 0.08,
+        'chest': 0.25, 'breasts': 0.22, 'nipples': 0.18, 'back': 0.22,
+        'abdomen': 0.20, 'lower_back': 0.20, 'arms': 0.45,
+        'hands': 0.50, 'fingers': 0.52, 'buttocks': 0.22,
+        'genitals': 0.10, 'perineum': 0.08, 'inner_thigh': 0.15,
+        'thighs': 0.18, 'knees': 0.10, 'shins': 0.08, 'feet': 0.10,
+    }
+
     def detect_physical_contact(self, other, body_height=6.0):
         """Detect physical contact between this body and another ShadowBody.
         Maps proximity between body regions to tactile zone stimulation.
@@ -10986,36 +11040,18 @@ class ShadowBody:
         # Proximity factor: 1.0 = touching, 0.0 = at edge of range
         _prox = 1.0 - (_dist / _touch_range)
         _prox_sq = _prox * _prox  # quadratic falloff for more natural feel
-        # Height of body regions (fraction of body_height from ground)
-        _ZONE_HEIGHT = {
-            'head': 0.92, 'face': 0.90, 'lips': 0.88, 'neck': 0.82,
-            'chest': 0.72, 'breasts': 0.70, 'nipples': 0.69, 'back': 0.68,
-            'abdomen': 0.58, 'lower_back': 0.55, 'arms': 0.60,
-            'hands': 0.42, 'fingers': 0.40, 'buttocks': 0.48,
-            'genitals': 0.45, 'perineum': 0.43, 'inner_thigh': 0.38,
-            'thighs': 0.35, 'knees': 0.28, 'shins': 0.18, 'feet': 0.04,
-        }
-        # Lateral extent (how far from center the zone extends, as fraction of body width)
-        _ZONE_LATERAL = {
-            'head': 0.15, 'face': 0.12, 'lips': 0.06, 'neck': 0.08,
-            'chest': 0.25, 'breasts': 0.22, 'nipples': 0.18, 'back': 0.22,
-            'abdomen': 0.20, 'lower_back': 0.20, 'arms': 0.45,
-            'hands': 0.50, 'fingers': 0.52, 'buttocks': 0.22,
-            'genitals': 0.10, 'perineum': 0.08, 'inner_thigh': 0.15,
-            'thighs': 0.18, 'knees': 0.10, 'shins': 0.08, 'feet': 0.10,
-        }
         # For each zone, check if this body's zone is close to any of other's zones
         _body_w = body_height * 0.25
-        for zname, zheight in _ZONE_HEIGHT.items():
+        for zname, zheight in self._ZONE_HEIGHT.items():
             _my_y = self.pos[1] + zheight * body_height
-            _my_lat = _ZONE_LATERAL.get(zname, 0.15) * _body_w
+            _my_lat = self._ZONE_LATERAL.get(zname, 0.15) * _body_w
             # Check against same-height region on other body
             _other_y = other.pos[1] + zheight * body_height
             _vert_dist = abs(_my_y - _other_y)
             if _vert_dist > body_height * 0.15:
                 continue
             # Effective contact intensity based on proximity and lateral overlap
-            _eff_range = _my_lat + _ZONE_LATERAL.get(zname, 0.15) * _body_w
+            _eff_range = _my_lat + self._ZONE_LATERAL.get(zname, 0.15) * _body_w
             _contact_intensity = _prox_sq * max(0.0, 1.0 - _vert_dist / (body_height * 0.15))
             if _contact_intensity > 0.05:
                 self.apply_touch(zname, _contact_intensity * 0.3, source_id=other.obs_id, is_pleasant=True)
@@ -11053,6 +11089,46 @@ class ShadowBody:
         if new_target is not None and new_target is not self._target_pose:
             self._target_pose = new_target
             self._blend_t = 0.0
+
+    def teleport_to(self, target_pos):
+        """Instantly teleport this AI body to target_pos (np array or list).
+        Triggers a brief dissolve/reappear animation via teleport_alpha."""
+        _tp = np.array(target_pos[:3], dtype=np.float64)
+        if not np.all(np.isfinite(_tp)):
+            return
+        if np.linalg.norm(_tp) > 1e8:
+            return
+        self.prev_pos = self.pos.copy()
+        self.pos = _tp.copy()
+        self.pos[1] = self.prev_pos[1]  # keep same ground level
+        self.teleport_alpha = 0.0  # fade-in effect
+        self.wander_target = None  # cancel any wander
+        self.anim_state = self.TELEPORTING if hasattr(self, 'TELEPORTING') else self.IDLE
+        # Update heading to face arrival direction
+        _delta = self.pos - self.prev_pos
+        _delta[1] = 0.0
+        _dlen = float(np.linalg.norm(_delta))
+        if _dlen > 1.0:
+            self.heading = math.atan2(float(_delta[0]), float(_delta[2]))
+
+    def teleport_to_body(self, other_body, offset=12.0):
+        """Teleport this AI body near another AI body to meet up.
+        Arrives offset units away facing the other body."""
+        if other_body is self:
+            return
+        _op = other_body.pos.copy()
+        if not np.all(np.isfinite(_op)):
+            return
+        # Arrive offset units away at a random angle
+        _angle = random.uniform(0, 2 * math.pi)
+        _arrival = _op + np.array([math.sin(_angle) * offset, 0.0, math.cos(_angle) * offset])
+        self.teleport_to(_arrival)
+        # Face the other body
+        _to_other = _op - self.pos
+        _to_other[1] = 0.0
+        _d = float(np.linalg.norm(_to_other))
+        if _d > 0.1:
+            self.heading = math.atan2(float(_to_other[0]), float(_to_other[2]))
 
     def set_talk(self, message, duration=4.0):
         self.talk_bubble = message
@@ -11103,7 +11179,7 @@ class ShadowBody:
             head_r = math.sqrt((htx - hx) ** 2 + (hty - hy) ** 2) * 0.48
             hcx = (hx + htx) * 0.5
             hcy = (hy + hty) * 0.5
-            ns = 24
+            ns = 48
             for i in range(ns):
                 a1 = 2 * _PI * i / ns
                 a2 = 2 * _PI * (i + 1) / ns
@@ -11128,7 +11204,7 @@ class ShadowBody:
             head_r = math.sqrt((htx - hx) ** 2 + (hty - hy) ** 2) * 0.48
             hcx = (hx + htx) * 0.5
             hcy = (hy + hty) * 0.5
-            ns = 24
+            ns = 48
             for i in range(ns):
                 a1 = 2 * _PI * i / ns
                 a2 = 2 * _PI * (i + 1) / ns
@@ -11586,7 +11662,7 @@ class ShadowBody:
                 # Short-medium hair cap — dense spheres on top and sides of head
                 # Top hair (wavy/curly from reference)
                 _h_rng = np.random.RandomState((hash(self.obs_id) + 42) & 0xFFFFFFFF)
-                for _hi in range(28):
+                for _hi in range(48):
                     _ha = _h_rng.uniform(0, 2 * _PI)
                     _hel = _h_rng.uniform(0.15, 0.85)
                     _hx = hcx + head_r * math.cos(_ha) * math.sin(_hel * _PI * 0.5) * 1.05
@@ -11600,10 +11676,56 @@ class ShadowBody:
             else:
                 # Long straight black hair — dense, voluminous, past mid-back
                 _h_rng = np.random.RandomState((hash(self.obs_id) + 42) & 0xFFFFFFFF)
-                _n_strands = 72
+                _n_strands = 120
                 _hair_len_base = h * self.hair_length
+                # === Body collision envelope for hair ===
+                # Build Y -> body_radius table so hair is pushed outside the body
+                _body_cx = hcx
+                _hair_envelope = []  # [(y, radius)] sorted top-to-bottom
+                if 'head' in positions:
+                    _hair_envelope.append((positions['head'][1], head_r * 0.55))
+                if 'neck' in positions:
+                    _hnr = _LIMB_WIDTH.get('neck', 0.038) * h * 0.5 * self.neck_scale * 1.4
+                    _hair_envelope.append((positions['neck'][1], _hnr))
+                if 'spine_chest' in positions:
+                    _htr = _LIMB_WIDTH.get('torso_upper', 0.14) * h * 0.5 * self.chest_scale
+                    _hsh = h * 0.05 * self.shoulder_scale
+                    _hair_envelope.append((positions['spine_chest'][1], max(_htr, _hsh) * 1.25))
+                if 'spine_naval' in positions:
+                    _hwr = _LIMB_WIDTH.get('torso_lower', 0.12) * h * 0.5 * self.waist_scale * self.waist_taper * 1.2
+                    _hair_envelope.append((positions['spine_naval'][1], _hwr))
+                if 'pelvis' in positions:
+                    _hhr = _LIMB_WIDTH.get('thigh', 0.07) * h * 0.5 * self.hip_scale * self.hip_flare * 1.2
+                    _hair_envelope.append((positions['pelvis'][1], _hhr))
+                _hair_envelope.sort(key=lambda e: -e[0])
+                def _body_r_at_y(_by):
+                    if not _hair_envelope:
+                        return 0.0
+                    if _by >= _hair_envelope[0][0]:
+                        return _hair_envelope[0][1]
+                    if _by <= _hair_envelope[-1][0]:
+                        return _hair_envelope[-1][1]
+                    for _ei in range(len(_hair_envelope) - 1):
+                        _yt, _rt = _hair_envelope[_ei]
+                        _yb, _rb = _hair_envelope[_ei + 1]
+                        if _yb <= _by <= _yt:
+                            _ef = (_by - _yb) / max(0.001, _yt - _yb)
+                            return _rb + (_rt - _rb) * _ef
+                    return 0.0
+                def _push_hair_pt(_px, _py, _pz, _margin=1.18):
+                    _br = _body_r_at_y(_py) * _margin
+                    if _br < 0.001:
+                        return _px, _py, _pz
+                    _dx = _px - _body_cx
+                    _dxz = math.sqrt(_dx * _dx + _pz * _pz)
+                    if _dxz < _br:
+                        if _dxz < 0.0001:
+                            return _px, _py, _br if _pz >= 0 else -_br
+                        _sc = _br / _dxz
+                        return _body_cx + _dx * _sc, _py, _pz * _sc
+                    return _px, _py, _pz
                 # Hair cap — short volume strands covering top of head
-                for _hci in range(20):
+                for _hci in range(35):
                     _hca = _h_rng.uniform(0, 2 * _PI)
                     _hcel = _h_rng.uniform(0.4, 0.95)
                     _hcx2 = hcx + head_r * math.cos(_hca) * math.sin(_hcel * _PI * 0.5) * 1.02
@@ -11633,6 +11755,9 @@ class ShadowBody:
                     _tip_y = _hy - _hlen
                     _tip_x = _hx + _sway
                     _tip_z = _drift_z
+                    # Push mid and tip points outside body envelope
+                    _mid_x, _mid_y, _mid_z = _push_hair_pt(_mid_x, _mid_y, _mid_z)
+                    _tip_x, _tip_y, _tip_z = _push_hair_pt(_tip_x, _tip_y, _tip_z)
                     hair.append((_hx, _hy, _hz,
                                  _mid_x, _mid_y, _mid_z,
                                  _strand_r, 'hair_long'))
@@ -11696,21 +11821,31 @@ _shadow_focus_orbit = 0.0      # manual orbit angle (degrees) via middle-click d
 _shadow_focus_tilt = 0.0       # manual tilt angle (degrees) via up/down arrow keys
 
 _observer_screen_counter = 0  # throttle screen capture (expensive)
+_observer_full_data_counter = 0  # throttle full particle data rebuild
+_observer_full_data_cache = {}  # cached full particle/molecule data
+_observer_os_info_cache = {}   # cached OS info (platform never changes)
+_observer_psutil_counter = 0   # throttle psutil calls (expensive system calls)
+_observer_psutil_cache = {}    # cached psutil results
+_observer_src_path_cache = None  # cached source file path (never changes)
+_observer_src_stat_cache = {}    # cached source file mtime/size
+_observer_src_stat_counter = 0   # throttle filesystem stat calls
 
 def _get_sim_state_for_observers():
     """Package current simulation state for AI observer consumption.
     Includes screen capture so observers can SEE the simulation."""
     global _observer_screen_counter
+    # Use cached stats from update loop when available (avoids 3 redundant full-particle iterations)
+    _cs = getattr(update, '_cached_stats', None)
     state = {
         'n_particles': len(particles),
-        'n_atoms': sum(1 for p in particles if getattr(p, 'is_atom', False)),
+        'n_atoms': _cs[2] if _cs else sum(1 for p in particles if getattr(p, 'is_atom', False)),
         'simulation_time': simulation_time,
         'time_factor': time_factor,
         'V_total': V_total,
         'V_total_percent': V_total_percent,
-        'total_mass': sum(p.mass for p in particles),
-        'total_energy': sum(getattr(p, 'energy_kin', 0) + getattr(p, 'energy_rot', 0) for p in particles),
-        'total_charge': sum(getattr(p, 'charge', 0) for p in particles),
+        'total_mass': _cs[0] if _cs else sum(p.mass for p in particles),
+        'total_energy': _cs[1] if _cs else sum(getattr(p, 'energy_kin', 0) + getattr(p, 'energy_rot', 0) for p in particles),
+        'total_charge': _cs[7] if _cs else sum(getattr(p, 'charge', 0) for p in particles),
         'total_assemblies': _self_assembly.total_assemblies,
         'total_codes': _self_assembly.total_codes,
         'run_odds_active': _self_assembly.run_odds_active,
@@ -11800,8 +11935,9 @@ def _get_sim_state_for_observers():
                 continue
             _nearby = []
             for _sp in particles[:200]:
-                _sd = float(np.linalg.norm(_sp.pos - _sb.pos))
-                if _sd < 500.0 and math.isfinite(_sd):
+                _dd = _sp.pos - _sb.pos
+                _sd = math.sqrt(float(_dd[0]*_dd[0] + _dd[1]*_dd[1] + _dd[2]*_dd[2]))
+                if _sd < 500.0:
                     _nearby.append({
                         'type': getattr(_sp, 'base_type', 'unknown'),
                         'dist': round(_sd, 1),
@@ -11812,19 +11948,141 @@ def _get_sim_state_for_observers():
             _spatial_maps[_sb.obs_id] = _nearby[:30]
         state['spatial_awareness'] = _spatial_maps
     # Live code awareness: current source file modification time
-    try:
-        import os as _os_sens
-        _src_path = _os_sens.path.abspath(__file__)
-        _src_mtime = _os_sens.path.getmtime(_src_path)
-        state['source_file'] = _src_path
-        state['source_mtime'] = _src_mtime
-        state['source_size'] = _os_sens.path.getsize(_src_path)
-    except Exception:
-        pass
+    # Path is cached (never changes); mtime/size throttled to every 30th call (~90 frames)
+    global _observer_src_path_cache, _observer_src_stat_cache, _observer_src_stat_counter
+    if _observer_src_path_cache is None:
+        try:
+            import os as _os_sens
+            _observer_src_path_cache = _os_sens.path.abspath(__file__)
+        except Exception:
+            _observer_src_path_cache = ''
+    if _observer_src_path_cache:
+        _observer_src_stat_counter += 1
+        if _observer_src_stat_counter >= 30 or not _observer_src_stat_cache:
+            _observer_src_stat_counter = 0
+            try:
+                import os as _os_sens
+                _observer_src_stat_cache = {
+                    'source_file': _observer_src_path_cache,
+                    'source_mtime': _os_sens.path.getmtime(_observer_src_path_cache),
+                    'source_size': _os_sens.path.getsize(_observer_src_path_cache),
+                }
+            except Exception:
+                _observer_src_stat_cache = {}
+        state.update(_observer_src_stat_cache)
     # Camera awareness for spatial context
     state['camera_zoom'] = camera.zoom
     state['camera_rot'] = camera.rot.tolist() if hasattr(camera, 'rot') else [0, 0, 0]
     state['selected_particle_type'] = getattr(selected_particle, 'type', None) if selected_particle else None
+    # === FULL DATA ACCESS: all particles (beyond first 50) ===
+    # Cached and rebuilt every 5th call (~15 frames) to avoid expensive iteration every 3 frames
+    global _observer_full_data_counter, _observer_full_data_cache
+    _observer_full_data_counter += 1
+    if _observer_full_data_counter >= 5 or not _observer_full_data_cache:
+        _observer_full_data_counter = 0
+        _all_p_info = []
+        for _fp in particles:
+            _all_p_info.append({
+                'id': id(_fp), 'pos': _fp.pos.tolist(),
+                'type': getattr(_fp, 'base_type', 'unknown'),
+                'mass': _fp.mass, 'is_atom': getattr(_fp, 'is_atom', False),
+                'Z': getattr(_fp, 'Z', 0),
+                'charge': getattr(_fp, 'charge', 0),
+                'vel': _fp.vel.tolist() if hasattr(_fp, 'vel') and _fp.vel is not None else [0, 0, 0],
+                'bonds': len(getattr(_fp, 'bonds', [])),
+                'in_atom': getattr(_fp, 'in_atom', False),
+                'spawned_by': getattr(_fp, 'spawned_by', ''),
+            })
+        # === FULL DATA ACCESS: nanotech entities ===
+        _nt_info = []
+        for _nt in nanotech_loaded:
+            _nt_info.append({
+                'type': _nt.type, 'pos': _nt.pos.tolist(),
+                'alive': _nt.alive, 'energy': _nt.energy,
+                'aura_active': _nt.aura_active,
+                'rpm': getattr(_nt, 'rpm', 0),
+                'membrane_integrity': getattr(_nt, 'membrane_integrity', 1.0),
+                'ion_reservoir': getattr(_nt, 'ion_reservoir', 0),
+                'atp_level': getattr(_nt, 'atp_level', 0),
+                'spawned_by': getattr(_nt, 'spawned_by', ''),
+            })
+        # === FULL DATA ACCESS: all molecules ===
+        _mol_info = []
+        _p_set = set(particles)  # O(1) membership check instead of O(N) list scan
+        for _mi, _mg in enumerate(_spawned_molecules):
+            _live = [a for a in _mg if a in _p_set]
+            _syms = [atom_data.get(getattr(a, 'Z', 0), {}).get('symbol', '?') for a in _live]
+            _mol_info.append({
+                'index': _mi, 'formula': ''.join(_syms),
+                'n_atoms': len(_live),
+                'center': np.mean([a.pos for a in _live], axis=0).tolist() if _live else [0, 0, 0],
+            })
+        _observer_full_data_cache = {
+            'all_particles': _all_p_info,
+            'nanotech_entities': _nt_info,
+            'all_molecules': _mol_info,
+        }
+    state['all_particles'] = _observer_full_data_cache['all_particles']
+    state['nanotech_entities'] = _observer_full_data_cache['nanotech_entities']
+    state['all_molecules'] = _observer_full_data_cache['all_molecules']
+    # === FULL DATA ACCESS: history log ===
+    state['history_log'] = list(_history_log[-100:]) if _history_log else []
+    # === FULL DATA ACCESS: self-assembly state ===
+    state['self_assembly'] = {
+        'run_odds_active': _self_assembly.run_odds_active,
+        'total_assemblies': _self_assembly.total_assemblies,
+        'total_codes': _self_assembly.total_codes,
+        'discovery_time': getattr(_self_assembly, '_ro_discovery_time', None),
+        'found_life_atoms': len(getattr(_self_assembly, '_ro_found_life_atoms', [])),
+    }
+    # === FULL DATA ACCESS: OS / system info ===
+    # Static platform info cached once (never changes at runtime)
+    global _observer_os_info_cache, _observer_psutil_counter, _observer_psutil_cache
+    if not _observer_os_info_cache:
+        try:
+            import platform as _plat
+            _observer_os_info_cache = {
+                'platform': _plat.platform(),
+                'hostname': _plat.node(),
+                'processor': _plat.processor(),
+                'python': _plat.python_version(),
+            }
+        except Exception:
+            _observer_os_info_cache = {}
+    state['os_info'] = dict(_observer_os_info_cache)
+    # Psutil calls throttled to every 30th call (~90 frames) — expensive system calls
+    _observer_psutil_counter += 1
+    if _observer_psutil_counter >= 30 or not _observer_psutil_cache:
+        _observer_psutil_counter = 0
+        try:
+            import psutil as _psu
+            _observer_psutil_cache = {
+                'cpu_percent': _psu.cpu_percent(interval=0),
+                'ram_percent': _psu.virtual_memory().percent,
+                'ram_total_gb': round(_psu.virtual_memory().total / (1024**3), 1),
+            }
+        except Exception:
+            _observer_psutil_cache = {}
+    state['os_info'].update(_observer_psutil_cache)
+    # === FULL DATA ACCESS: simulation globals the AI can see ===
+    state['fps'] = current_fps
+    state['frame_count'] = frame_count
+    state['ui_scale'] = ui_scale
+    state['cloud_radius'] = cloud_radius
+    state['show_ui'] = show_ui
+    state['shadow_bodies_visible'] = _shadow_bodies_visible
+    state['shadow_focus_idx'] = _shadow_focus_idx
+    state['n_spawned_molecules'] = len(_spawned_molecules)
+    # === FULL DATA ACCESS: GNA terminal output (AI sees tracer data) ===
+    state['gna_running'] = _gna_running
+    state['gna_allowed'] = _gna_allowed
+    try:
+        with _gna_output_lock:
+            state['gna_terminal'] = list(_gna_output[-50:])
+    except Exception:
+        state['gna_terminal'] = []
+    # === FULL DATA ACCESS: observer chat log ===
+    state['observer_chat_log'] = [(t, s, r, m) for t, s, r, m in list(_obs_chat_log)[-30:]]
     # Screen capture â€" every 5th call to avoid framebuffer overhead
     _observer_screen_counter += 1
     if _observer_screen_counter % 5 == 0:
@@ -11916,7 +12174,31 @@ def _execute_observer_action(obs, action_type, params):
         ok = True
     elif action_type == 'focus_particle':
         obs.focus_target_id = params.get('target_id')
+        # Teleport body to the focused particle's position
+        _target_id = params.get('target_id')
+        if _target_id is not None:
+            for _fp in particles:
+                if id(_fp) == _target_id:
+                    _sb_idx = next((i for i, sb in enumerate(_shadow_bodies) if sb.obs_id == obs.name), -1)
+                    if _sb_idx >= 0:
+                        _shadow_bodies[_sb_idx].teleport_to(_fp.pos)
+                    break
         ok = True
+    elif action_type == 'teleport':
+        # AI teleports body to arbitrary position
+        _tp = np.array(params.get('pos', [0, 0, 0]), dtype=float)
+        _sb_idx = next((i for i, sb in enumerate(_shadow_bodies) if sb.obs_id == obs.name), -1)
+        if _sb_idx >= 0:
+            _shadow_bodies[_sb_idx].teleport_to(_tp)
+            ok = True
+    elif action_type == 'teleport_to_peer':
+        # AI teleports body to another AI body to meet up
+        _peer_name = params.get('peer_name', '')
+        _sb_idx = next((i for i, sb in enumerate(_shadow_bodies) if sb.obs_id == obs.name), -1)
+        _peer_idx = next((i for i, sb in enumerate(_shadow_bodies) if sb.obs_id == _peer_name), -1)
+        if _sb_idx >= 0 and _peer_idx >= 0 and _sb_idx != _peer_idx:
+            _shadow_bodies[_sb_idx].teleport_to_body(_shadow_bodies[_peer_idx])
+            ok = True
     elif action_type == 'toggle_loadin':
         li_key = params.get('key', '')
         if li_key in _ai_loadins:
@@ -29243,6 +29525,7 @@ def on_resize(width, height):
     global WIDTH, HEIGHT, _UI_BAR_H, particle_list_x, particle_list_y, particle_list_width, particle_list_height
     global positron_list_x, positron_list_y, positron_list_width, positron_list_height
     global atom_list_x, atom_list_y, atom_list_width, atom_list_height
+    global ai_body_list_x, ai_body_list_y, ai_body_list_width, ai_body_list_height
     if width < 10 or height < 10:
         return
     try:
@@ -29297,6 +29580,10 @@ def on_resize(width, height):
         positron_list_y = max(10, HEIGHT - _UI_BAR_H - list_panel_h - 10)
         positron_list_width = list_panel_w
         positron_list_height = list_panel_h
+        ai_body_list_width = min(300, list_panel_w)
+        ai_body_list_x = max(10, WIDTH - ai_body_list_width - 10)
+        ai_body_list_y = max(10, HEIGHT - _UI_BAR_H - list_panel_h - 10)
+        ai_body_list_height = list_panel_h
 
     except Exception:
         pass
@@ -29305,6 +29592,7 @@ def on_resize(width, height):
 @window.event
 def on_key_press(symbol, modifiers):
     global ui_scale, show_ui, show_particle_list, show_cluster_list, show_atom_list, show_positron_list, time_factor, selected_particle, placement_mode, atom_placement_mode, particle_list_offset, cluster_list_offset, atom_list_offset, positron_list_offset, paused, selected_placement_type, selected_atom_z, show_menu, show_info, show_input_popup, input_number, toggle_yellow_lines, toggle_particle_labels, toggle_atom_names_macro, toggle_orbital_paths, toggle_gravity_paths, toggle_forward_paths, lqcd_mode, lqcd, show_info_overlay, toggle_em_field, toggle_wave_field, show_ptype_list, show_atype_list, ptype_list_offset, atype_list_offset, ptype_highlight, atype_highlight, show_exit_confirm, toggle_grid, physics_accumulator, toggle_radiation_density, show_time_input, time_input_text, simulation_time, show_sphere_nav, show_sphere_map, sphere_nav_frozen, _sphere_snap_idx, V_total, V_total_percent, vtotal_manual, show_history, toggle_bond_lines, show_sound_panel, show_nanotech_list, nanotech_highlight, show_molecules_panel, molecules_highlight, show_controls_panel, _controls_capturing, _controls_scroll_offset, _nanotech_focus_idx, _molecule_focus_idx, _spawned_molecules, show_nanotech_focus_list, show_molecule_focus_list, _nanotech_focus_scroll, _molecule_focus_scroll, toggle_grav_potential, toggle_kinetic_field, _sphere_nav_time_frac, _sphere_nav_interp_idx_a, _sphere_nav_interp_idx_b, _sphere_nav_interp_t, show_observer_panel, _observer_panel_highlight, _f1_scroll_offset, toggle_mandelbrot_grid, show_mandelbrot_map, _mandelbrot_zoom, _mandelbrot_center_r, _mandelbrot_center_i, _mandelbrot_3d_cache, _mandelbrot_3d_cache_key, _mandelbrot_cache, _mandelbrot_cache_key, show_ai_dashboard, _f1_page, _pause_start_time, _afk_auto_unpause, _afk_enabled, show_life_forms_list, life_forms_highlight, life_forms_selected, life_forms_scroll, expansion_scale, cloud_radius, _det_playhead, _shadow_bodies_visible, _shadow_outline_white, _shadow_focus_idx, _shadow_focus_orbit, _shadow_focus_tilt
+    global show_ai_body_list, ai_body_list_offset, ai_body_labels
     global show_spectrum_panel, _ai_dashboard_tab, _ai_chat_input_active, _ai_chat_input_text
     global _ai_os_input_blocked, _ai_os_confirm_prompt
     global _gna_confirm_prompt, _gna_show_terminal, _gna_running, _gna_browser_control
@@ -29720,6 +30008,20 @@ def on_key_press(symbol, modifiers):
                 label_text = f"{_sb_tag}{a.type}  âˆž:{_inf_addr}  Î¦:{_phi_addr}"
                 atom_labels.append(
                     Label(label_text, x=0, y=0, font_size=10, color=_TH_TEXT, anchor_y='bottom'))
+    elif symbol == hotkey_map.get('show_ai_bodies'):
+        show_ai_body_list = not show_ai_body_list
+        ai_body_labels.clear()
+        ai_body_list_offset = 0
+        if show_ai_body_list:
+            ai_body_labels.append(
+                Label("-- Deselect --", x=0, y=0, font_size=10, color=(255, 100, 100, 255), anchor_y='bottom'))
+            for _abi, _ab in enumerate(_shadow_bodies):
+                _ab_name = getattr(_ab, 'name', getattr(_ab, 'obs_id', f'Body{_abi}'))
+                _ab_gender = getattr(_ab, 'gender', '?')
+                _ab_state = 'ACTIVE' if getattr(_ab, '_visible', True) else 'HIDDEN'
+                label_text = f"#{_abi} {_ab_name} ({_ab_gender}) [{_ab_state}]"
+                ai_body_labels.append(
+                    Label(label_text, x=0, y=0, font_size=10, color=_TH_TEXT, anchor_y='bottom'))
     elif symbol == hotkey_map.get('ui_down'):
         ui_scale = max(0.5, ui_scale - 0.1)
     elif symbol == hotkey_map.get('ui_up'):
@@ -29730,6 +30032,8 @@ def on_key_press(symbol, modifiers):
             _ai_dashboard_scroll = 0
             if _ai_dashboard_tab < 3 or _ai_dashboard_tab == 4:
                 _ai_chat_input_active = False
+        elif symbol == pyglet.window.key.LEFT and _shadow_focus_idx >= 0 and _shadow_bodies:
+            _shadow_focus_orbit -= 15.0
         else:
             camera.rotate(0.1, 0)
     elif symbol in (pyglet.window.key.RIGHT, pyglet.window.key.D):
@@ -29738,6 +30042,8 @@ def on_key_press(symbol, modifiers):
             _ai_dashboard_scroll = 0
             if _ai_dashboard_tab < 3 or _ai_dashboard_tab == 4:
                 _ai_chat_input_active = False
+        elif symbol == pyglet.window.key.RIGHT and _shadow_focus_idx >= 0 and _shadow_bodies:
+            _shadow_focus_orbit += 15.0
         else:
             camera.rotate(-0.1, 0)
     elif symbol in (pyglet.window.key.UP, pyglet.window.key.W):
@@ -30139,6 +30445,7 @@ def on_mouse_press(x, y, button, modifiers):
     global particle_drag_start_y, particle_drag_start_offset
     global atom_drag_start_y, atom_drag_start_offset
     global positron_drag_start_y, positron_drag_start_offset
+    global ai_body_thumb_dragging, ai_body_drag_start_y, ai_body_drag_start_offset, ai_body_list_offset
     global sphere_nav_frozen, vtotal_manual, _det_playhead, simulation_time
     global expansion_scale, cloud_radius, V_total, V_total_percent
     global _sphere_nav_interp_idx_a, _sphere_nav_interp_idx_b, _sphere_nav_interp_t
@@ -30201,6 +30508,9 @@ def on_mouse_press(x, y, button, modifiers):
                 camera.zoom = max(camera.MIN_ZOOM, _nt_size / 100.0)
                 _st = 'ALIVE' if _target.alive else 'DEAD'
                 focus_label.text = f"Focusing: {_target.type} #{sel_i} [{_st}]"
+                # Teleport focused AI body to this nanotech entity
+                if _shadow_focus_idx >= 0 and _shadow_focus_idx < len(_shadow_bodies):
+                    _shadow_bodies[_shadow_focus_idx].teleport_to(_target.pos)
             return
     # [5] Molecule Focus list — click item to focus camera
     if show_molecule_focus_list:
@@ -30224,6 +30534,9 @@ def on_mouse_press(x, y, button, modifiers):
                     camera.focus_on_particle(selected_particle)
                     _syms = [atom_data.get(getattr(a, 'Z', 0), {}).get('symbol', '?') for a in _live]
                     focus_label.text = f"Focusing: {''.join(_syms)} Molecule #{sel_i} ({len(_live)} atoms)"
+                    # Teleport focused AI body to this molecule
+                    if _shadow_focus_idx >= 0 and _shadow_focus_idx < len(_shadow_bodies):
+                        _shadow_bodies[_shadow_focus_idx].teleport_to(selected_particle.pos)
             return
     # Key 9 Life Forms panel click handling
     if show_life_forms_list:
@@ -30667,6 +30980,9 @@ def on_mouse_press(x, y, button, modifiers):
                 selected_particle = loose_particles[sel_i]
                 selected_cluster = None
                 camera.focus_on_particle(selected_particle)
+                # Teleport focused AI body to this particle
+                if _shadow_focus_idx >= 0 and _shadow_focus_idx < len(_shadow_bodies):
+                    _shadow_bodies[_shadow_focus_idx].teleport_to(selected_particle.pos)
                 return
     if show_atom_list:
         line_height = int(22 * ui_scale)
@@ -30690,6 +31006,9 @@ def on_mouse_press(x, y, button, modifiers):
                 selected_particle = atoms[sel_i]
                 selected_cluster = None
                 camera.focus_on_particle(selected_particle)
+                # Teleport focused AI body to this atom
+                if _shadow_focus_idx >= 0 and _shadow_focus_idx < len(_shadow_bodies):
+                    _shadow_bodies[_shadow_focus_idx].teleport_to(selected_particle.pos)
                 return
     if show_positron_list:
         line_height = int(22 * ui_scale)
@@ -30713,8 +31032,51 @@ def on_mouse_press(x, y, button, modifiers):
                 selected_particle = positrons[sel_i]
                 selected_cluster = None
                 camera.focus_on_particle(selected_particle)
+                # Teleport focused AI body to this positron
+                if _shadow_focus_idx >= 0 and _shadow_focus_idx < len(_shadow_bodies):
+                    _shadow_bodies[_shadow_focus_idx].teleport_to(selected_particle.pos)
                 return
-    is_over_ui = show_particle_list or show_atom_list or show_positron_list or show_menu or show_input_popup or show_nanotech_focus_list or show_molecule_focus_list
+    if show_ai_body_list:
+        line_height = int(22 * ui_scale)
+        visible_lines = int(ai_body_list_height / line_height)
+        total_items = len(ai_body_labels)
+        if total_items > visible_lines:
+            max_scroll = total_items - visible_lines
+            thumb_height = max(20, ai_body_list_height * visible_lines / total_items)
+            thumb_y = ai_body_list_y + (ai_body_list_offset / max_scroll) * (
+                        ai_body_list_height - thumb_height) if max_scroll > 0 else ai_body_list_y
+            if ai_body_list_x + ai_body_list_width - 10 <= x <= ai_body_list_x + ai_body_list_width and thumb_y <= y <= thumb_y + thumb_height:
+                ai_body_thumb_dragging = True
+                ai_body_drag_start_y = y
+                ai_body_drag_start_offset = ai_body_list_offset
+                return
+        if ai_body_list_x <= x <= ai_body_list_x + ai_body_list_width - 10 and ai_body_list_y <= y <= ai_body_list_y + ai_body_list_height:
+            j = int((ai_body_list_y + ai_body_list_height - y) / line_height)
+            sel_i = ai_body_list_offset + j
+            if sel_i == 0:
+                # Deselect entry
+                _shadow_focus_idx = -1
+                selected_particle = None
+                selected_cluster = None
+                focus_label.text = ""
+                return
+            _body_i = sel_i - 1  # offset by 1 for Deselect entry
+            if 0 <= _body_i < len(_shadow_bodies):
+                _sb_sel = _shadow_bodies[_body_i]
+                selected_particle = None
+                selected_cluster = None
+                _shadow_focus_idx = _body_i
+                if np.all(np.isfinite(_sb_sel.pos)) and np.linalg.norm(_sb_sel.pos) < 1e8:
+                    camera.pos = _sb_sel.pos.copy()
+                _sb_h = getattr(_sb_sel, 'height', 180.0)
+                _half_fov = math.radians(45) / 2
+                _d = _sb_h / math.tan(_half_fov * 0.5)
+                camera.zoom = max(camera.MIN_ZOOM, _d / 1125) if _d > 0 else 1.0
+                _ab_name = getattr(_sb_sel, 'name', getattr(_sb_sel, 'obs_id', f'Body{_body_i}'))
+                focus_label.text = f"Focusing on: {_ab_name} Shadow Body"
+                return
+    _ai_body_over = show_ai_body_list and ai_body_list_x <= x <= ai_body_list_x + ai_body_list_width and ai_body_list_y <= y <= ai_body_list_y + ai_body_list_height
+    is_over_ui = show_particle_list or show_atom_list or show_positron_list or _ai_body_over or show_menu or show_input_popup or show_nanotech_focus_list or show_molecule_focus_list
     if button == pyglet.window.mouse.RIGHT and not is_over_ui:
         panning = True
         selected_particle = None
@@ -30776,7 +31138,53 @@ def on_mouse_press(x, y, button, modifiers):
                 if dist < hit_r and dist < min_dist:
                     min_dist = dist
                     closest = p
-        if closest and min_dist < _click_r:
+        # --- Shadow body (AI body) hit detection ---
+        _sb_closest = None
+        _sb_min_dist = float('inf')
+        _sb_closest_idx = -1
+        for _sbi, _sb in enumerate(_shadow_bodies):
+            if not np.all(np.isfinite(_sb.pos)):
+                continue
+            _sb_rel = rotate_vector(_sb.pos - camera.pos, camera.rot)
+            if not np.all(np.isfinite(_sb_rel)):
+                continue
+            try:
+                _sb_wx, _sb_wy, _sb_wz = gluProject(float(_sb_rel[0]), float(_sb_rel[1]), float(_sb_rel[2]), model, proj, view)
+                if _sb_wz > 1.0:
+                    continue
+                _sb_screen_dist = math.sqrt((x - _sb_wx) ** 2 + (y - _sb_wy) ** 2)
+                _sb_hit_r = max(_click_r, getattr(_sb, 'height', 180.0) * 0.3 / (camera.zoom + 1))
+                if _sb_screen_dist < _sb_hit_r and _sb_screen_dist < _sb_min_dist:
+                    _sb_min_dist = _sb_screen_dist
+                    _sb_closest = _sb
+                    _sb_closest_idx = _sbi
+            except Exception:
+                pass
+        # Decide: pick whichever is closer — particle or shadow body
+        _pick_particle = closest and min_dist < _click_r
+        _pick_sb = _sb_closest is not None and _sb_min_dist < max(_click_r, 60)
+        if _pick_particle and _pick_sb:
+            # Both in range — prefer whichever is closer on screen
+            if min_dist <= _sb_min_dist:
+                _pick_sb = False
+            else:
+                _pick_particle = False
+        if _pick_sb:
+            selected_particle = None
+            selected_cluster = None
+            _shadow_focus_idx = _sb_closest_idx
+            if _dbl:
+                if np.all(np.isfinite(_sb_closest.pos)) and np.linalg.norm(_sb_closest.pos) < 1e8:
+                    camera.pos = _sb_closest.pos.copy()
+                _sb_h = getattr(_sb_closest, 'height', 180.0)
+                _half_fov = math.radians(45) / 2
+                _d = _sb_h / math.tan(_half_fov * 0.5)
+                camera.zoom = max(camera.MIN_ZOOM, _d / 1125) if _d > 0 else 1.0
+            _ab_name = getattr(_sb_closest, 'name', getattr(_sb_closest, 'obs_id', f'Body{_sb_closest_idx}'))
+            focus_label.text = f"Focusing on: {_ab_name} Shadow Body"
+            print(f"Selected AI Body: {_ab_name}")
+            return
+        if _pick_particle:
             selected_particle = closest
             selected_cluster = None
             _shadow_focus_idx = -1  # Clear shadow body focus to prevent overlay conflict
@@ -30795,20 +31203,21 @@ def on_mouse_press(x, y, button, modifiers):
 
 @window.event
 def on_mouse_release(x, y, button, modifiers):
-    global dragging, panning, particle_thumb_dragging, cluster_thumb_dragging, atom_thumb_dragging, positron_thumb_dragging
+    global dragging, panning, particle_thumb_dragging, cluster_thumb_dragging, atom_thumb_dragging, positron_thumb_dragging, ai_body_thumb_dragging
     if button == pyglet.window.mouse.LEFT:
         dragging = False
         particle_thumb_dragging = False
         cluster_thumb_dragging = False
         atom_thumb_dragging = False
         positron_thumb_dragging = False
+        ai_body_thumb_dragging = False
     if button == pyglet.window.mouse.RIGHT:
         panning = False
 
 
 @window.event
 def on_mouse_drag(x, y, dx, dy, buttons, modifiers):
-    global dragging, panning, particle_thumb_dragging, cluster_thumb_dragging, atom_thumb_dragging, positron_thumb_dragging, _shadow_focus_orbit
+    global dragging, panning, particle_thumb_dragging, cluster_thumb_dragging, atom_thumb_dragging, positron_thumb_dragging, ai_body_thumb_dragging, _shadow_focus_orbit
     if particle_thumb_dragging:
         # handle drag
         line_height = int(22 * ui_scale)
@@ -30834,6 +31243,14 @@ def on_mouse_drag(x, y, dx, dy, buttons, modifiers):
         dy_drag = y - positron_drag_start_y
         scale_factor = max_scroll / (positron_list_height - max(20, positron_list_height * visible_lines / total_items))
         positron_list_offset = max(0, min(positron_drag_start_offset - int(dy_drag * scale_factor), max_scroll))
+    elif ai_body_thumb_dragging:
+        line_height = int(22 * ui_scale)
+        visible_lines = int(ai_body_list_height / line_height)
+        total_items = len(ai_body_labels)
+        max_scroll = max(0, total_items - visible_lines)
+        dy_drag = y - ai_body_drag_start_y
+        scale_factor = max_scroll / (ai_body_list_height - max(20, ai_body_list_height * visible_lines / total_items))
+        ai_body_list_offset = max(0, min(ai_body_drag_start_offset - int(dy_drag * scale_factor), max_scroll))
     elif buttons & pyglet.window.mouse.MIDDLE and _shadow_focus_idx >= 0:
         # Middle-click drag orbits the focused shadow body
         _shadow_focus_orbit += dx * 0.5
@@ -30844,7 +31261,7 @@ def on_mouse_drag(x, y, dx, dy, buttons, modifiers):
 
 @window.event
 def on_mouse_scroll(x, y, scroll_x, scroll_y):
-    global particle_list_offset, cluster_list_offset, atom_list_offset, positron_list_offset, ptype_list_offset, atype_list_offset, _controls_scroll_offset, _nanotech_focus_scroll, _molecule_focus_scroll, _f1_scroll_offset, _mandelbrot_zoom, _mandelbrot_cache, _mandelbrot_cache_key, _mandelbrot_3d_cache, _mandelbrot_3d_cache_key, _ai_dashboard_scroll
+    global particle_list_offset, cluster_list_offset, atom_list_offset, positron_list_offset, ai_body_list_offset, ptype_list_offset, atype_list_offset, _controls_scroll_offset, _nanotech_focus_scroll, _molecule_focus_scroll, _f1_scroll_offset, _mandelbrot_zoom, _mandelbrot_cache, _mandelbrot_cache_key, _mandelbrot_3d_cache, _mandelbrot_3d_cache_key, _ai_dashboard_scroll
     # Scroll AI Activity Dashboard content
     if show_ai_dashboard:
         _ai_w = min(600, WIDTH - 40)
@@ -30932,6 +31349,11 @@ def on_mouse_scroll(x, y, scroll_x, scroll_y):
         visible_lines = int(positron_list_height / line_height)
         max_scroll = max(0, len(positron_labels) - visible_lines)
         positron_list_offset = max(0, min(positron_list_offset - int(scroll_y), max_scroll))
+    elif show_ai_body_list and ai_body_list_x <= x <= ai_body_list_x + ai_body_list_width and ai_body_list_y <= y <= ai_body_list_y + ai_body_list_height:
+        line_height = int(22 * ui_scale)
+        visible_lines = int(ai_body_list_height / line_height)
+        max_scroll = max(0, len(ai_body_labels) - visible_lines)
+        ai_body_list_offset = max(0, min(ai_body_list_offset - int(scroll_y), max_scroll))
     else:
         if scroll_y > 0:
             camera.zoom_in()
@@ -30957,7 +31379,7 @@ def update(dt):
     # Cap dt to prevent spiral-of-death from OS sleep/lag spikes
     dt = min(dt, 0.25)
     # Performance governor: record frame time and adapt quality
-    _perf.record_frame(dt)
+    _perf.record_frame(dt, len(particles))
     _perf.maybe_adjust()
     # Default render alpha to 0.0; overwritten by physics substep loop if active
     _render_alpha = 0.0
@@ -31164,7 +31586,7 @@ def update(dt):
             # Tracks: total energy, momentum, charge, baryon #, lepton #
             # Ref: Noether (1918); Peskin & Schroeder Ch.2
             # ══════════════════════════════════════════════════════════════
-            if steps_done > 0 and _n_parts > 0:
+            if steps_done > 0 and _n_parts > 0 and frame_count % 30 == 0:
                 _total_E = 0.0
                 _total_p = np.zeros(3)
                 _total_Q = 0.0
@@ -31243,9 +31665,9 @@ def update(dt):
                     except Exception as _ee:
                         print(f"[EMERGENCY] Save failed: {_ee}")
 
-            # == GLOBAL NaN FIREWALL — sanitize all particles every frame ==
+            # == GLOBAL NaN FIREWALL — sanitize all particles periodically ==
             # Catches corruption from any source (GPU, pairwise, integrator)
-            if steps_done > 0:
+            if steps_done > 0 and frame_count % 10 == 0:
                 for _fp in all_particles:
                     if getattr(_fp, 'base_type', '') == 'decayed':
                         continue
@@ -31296,8 +31718,10 @@ def update(dt):
                                 _q.pos += _atom_delta
             # Remove decayed particles and cull distant massless/neutrino particles
             # Skip culling during reverse to preserve particle count
+            # Merged: count atoms in same pass to avoid redundant iteration
+            _pre_atoms = 0
             if not _is_reverse_live:
-                # No hard particle cap â€” unlimited atoms and spatial expansion supported
+                # No hard particle cap — unlimited atoms and spatial expansion supported
                 cull_dist = max(5000.0, 2000.0 * camera.zoom)
                 to_remove = []
                 for p in particles:
@@ -31308,13 +31732,14 @@ def update(dt):
                         to_remove.append(p)
                     elif 'neutrino' in bt and np.linalg.norm(p.pos - camera.pos) > cull_dist * 0.5:
                         to_remove.append(p)
+                    elif p.is_atom and bt != 'decayed':
+                        _pre_atoms += 1
                 if to_remove:
                     _remove_set = set(to_remove)
                     if selected_particle in _remove_set:
                         selected_particle = None
                     particles[:] = [p for p in particles if p not in _remove_set]
             _pre_n = len(particles)
-            _pre_atoms = sum(1 for p in particles if p.is_atom and getattr(p, 'base_type', '') != 'decayed')
             if not _is_reverse_live:
                 # Double-slit experiment: emit photons and detect interference
                 _double_slit_exp.emit_photons(particles)
@@ -31352,13 +31777,18 @@ def update(dt):
                     _history_log.append((simulation_time, f"Info Code emerged: {_self_assembly.info_codes[-1] if _self_assembly.info_codes else '?'}"))
                     if len(_history_log) > _history_max:
                         _history_log.pop(0)
-            # History event logging
+            # History event logging (skip atom counting in reverse — never used)
             _post_n = len(particles)
-            _post_atoms = sum(1 for p in particles if p.is_atom and getattr(p, 'base_type', '') != 'decayed')
             if not _is_reverse_live:
+                # Single pass: count atoms AND collect atom list simultaneously
+                _post_atoms = 0
+                _atom_list = []
+                for p in particles:
+                    if p.is_atom and getattr(p, 'base_type', '') != 'decayed':
+                        _post_atoms += 1
+                        _atom_list.append(p)
                 if _post_atoms > _pre_atoms:
-                    _new_atoms = [p for p in particles if p.is_atom and getattr(p, 'base_type', '') != 'decayed']
-                    _names = [f"{atom_data.get(a.Z, {}).get('symbol', '?')}-{getattr(a, 'A', '?')}" for a in _new_atoms[-(_post_atoms - _pre_atoms):]]
+                    _names = [f"{atom_data.get(a.Z, {}).get('symbol', '?')}-{getattr(a, 'A', '?')}" for a in _atom_list[-(_post_atoms - _pre_atoms):]]
                     _history_log.append((simulation_time, f"Atom formed: {', '.join(_names)}"))
                     if len(_history_log) > _history_max:
                         _history_log.pop(0)
@@ -31383,18 +31813,21 @@ def update(dt):
         camera.pos = _nt_prev + (_nt.pos - _nt_prev) * _render_alpha
     # === Observer Consciousness System: Always Perceive, Act Only When Unpaused ===
     if _observer_mgr and _OBSERVER_AVAILABLE:
-        try:
-            _obs_state = _get_sim_state_for_observers()
-            _obs_state['ai_spawn_allowed'] = _ai_spawn_allowed
-            _observer_mgr.update(_obs_state, time.time())
-            if not paused:
-                for _obs_entity, _obs_act, _obs_params in _observer_mgr.get_resolved_actions():
-                    _execute_observer_action(_obs_entity, _obs_act, _obs_params)
-            else:
-                # While paused: AI still perceives and learns, but actions are queued
-                _observer_mgr.get_resolved_actions()  # consume but discard
-        except Exception as _obs_main_err:
-            print(f"[Observer] Error: {type(_obs_main_err).__name__}: {_obs_main_err}")
+        # Throttle expensive observer perception to every 3 frames (~20Hz)
+        # _get_sim_state_for_observers iterates all particles 3x per call
+        if frame_count % 3 == 0:
+            try:
+                _obs_state = _get_sim_state_for_observers()
+                _obs_state['ai_spawn_allowed'] = _ai_spawn_allowed
+                _observer_mgr.update(_obs_state, time.time())
+                if not paused:
+                    for _obs_entity, _obs_act, _obs_params in _observer_mgr.get_resolved_actions():
+                        _execute_observer_action(_obs_entity, _obs_act, _obs_params)
+                else:
+                    # While paused: AI still perceives and learns, but actions are queued
+                    _observer_mgr.get_resolved_actions()  # consume but discard
+            except Exception as _obs_main_err:
+                print(f"[Observer] Error: {type(_obs_main_err).__name__}: {_obs_main_err}")
         _abs_st = abs(simulation_time)
         _t_sign = "-" if simulation_time < 0 else ""
         hours = int(_abs_st // 3600)
@@ -31424,37 +31857,41 @@ def update(dt):
             time_factor_label.text = f"Time Factor: {_tf_pct:.6f}% [{_ratio_str}]{_rev_tag}{_extrap_tag}"
         else:
             time_factor_label.text = f"Time Factor: {_tf_pct:.1f}% [{_ratio_str}]{_rev_tag}{_extrap_tag}"
-        # Single-pass stats to avoid multiple list traversals
-        total_mass = 0.0
-        total_energy = 0.0
-        n_atoms = 0
-        n_independent = 0
-        n_sub = 0
-        n_stable = 0
-        n_anti = 0
-        total_charge = 0.0
-        rank_score = 0
-        quantum_bindings = 0
-        _positions = []
-        for p in particles:
-            total_mass += p.mass
-            total_energy += p.energy_kin + p.energy_rot
-            total_charge += p.charge
-            bt = getattr(p, 'base_type', '')
-            if bt != 'decayed':
-                n_stable += 1
-                _positions.append(p.pos)
-            if 'anti_' in bt:
-                n_anti += 1
-            if p.is_atom:
-                n_atoms += 1
-                _nsub = len(p.sub_particles)
-                n_sub += _nsub
-                rank_score += 3 + 2 * _nsub
-                quantum_bindings += _nsub
-            else:
-                n_independent += 1
-                rank_score += 1
+        # Single-pass stats to avoid multiple list traversals (throttled to every 5 frames)
+        if frame_count % 5 != 0 and hasattr(update, '_cached_stats'):
+            total_mass, total_energy, n_atoms, n_independent, n_sub, n_stable, n_anti, total_charge, rank_score, quantum_bindings, _positions = update._cached_stats
+        else:
+            total_mass = 0.0
+            total_energy = 0.0
+            n_atoms = 0
+            n_independent = 0
+            n_sub = 0
+            n_stable = 0
+            n_anti = 0
+            total_charge = 0.0
+            rank_score = 0
+            quantum_bindings = 0
+            _positions = []
+            for p in particles:
+                total_mass += p.mass
+                total_energy += p.energy_kin + p.energy_rot
+                total_charge += p.charge
+                bt = getattr(p, 'base_type', '')
+                if bt != 'decayed':
+                    n_stable += 1
+                    _positions.append(p.pos)
+                if 'anti_' in bt:
+                    n_anti += 1
+                if p.is_atom:
+                    n_atoms += 1
+                    _nsub = len(p.sub_particles)
+                    n_sub += _nsub
+                    rank_score += 3 + 2 * _nsub
+                    quantum_bindings += _nsub
+                else:
+                    n_independent += 1
+                    rank_score += 1
+            update._cached_stats = (total_mass, total_energy, n_atoms, n_independent, n_sub, n_stable, n_anti, total_charge, rank_score, quantum_bindings, _positions)
         # === V_total: Unified Reality-Weight (refined formula) ===
         # Dimensional Sphere: INFINITY_MAP = 5,184,000 = practical infinity
         # Formula: V = [5Â·(innerÂ²) + 1.001Â·VÂ·(VÂ²+V)Â·0.001V] Â· recursive Â· âˆž_norm Â· V
@@ -31556,21 +31993,25 @@ def update(dt):
         else:
             vtotal_slider_fill.width = 0
         vtotal_pct_label.text = f"V%: {_vpct_str}"
-        # Save dimensional sphere snapshot for deterministic navigation
-        if not sphere_nav_frozen and not _replay_active:
+        # Save dimensional sphere snapshot and/or deterministic frame for time travel
+        # Share _record_particle_states result if both trigger in the same frame (expensive deep copy)
+        _frame_states = None
+        _need_sphere = not sphere_nav_frozen and not _replay_active
+        _need_det = not _replay_active and not _perf.skip_det_frames and (frame_count % _perf.det_record_interval == 0)
+        if _need_sphere:
             _sphere_snap_counter += 1
-            if _sphere_snap_counter >= _sphere_snap_interval:
+            if _sphere_snap_counter >= _perf.sphere_snap_interval:
                 _sphere_snap_counter = 0
-                _snap_states = _record_particle_states(particles)
-                _sphere_snapshots.append((simulation_time, V_total, V_total_percent, _snap_states))
+                _frame_states = _record_particle_states(particles)
+                _sphere_snapshots.append((simulation_time, V_total, V_total_percent, _frame_states))
                 if len(_sphere_snapshots) > _sphere_snap_max:
                     _sphere_snapshots.pop(0)
-        # === Record deterministic frame for time travel ===
-        # Skip recording in survival mode to save CPU (state copy is expensive)
-        if not _replay_active and not _perf.skip_det_frames and (frame_count % _perf.det_record_interval == 0):
+        if _need_det:
+            if _frame_states is None:
+                _frame_states = _record_particle_states(particles)
             _det_frames.append((
                 simulation_time, expansion_scale, cloud_radius, V_total, V_total_percent,
-                _record_particle_states(particles)
+                _frame_states
             ))
             if len(_det_frames) > _det_frame_max:
                 _det_frames.pop(0)
@@ -31837,7 +32278,7 @@ def on_draw():
                 # Frustum cull: skip if well behind camera (zoom*100 is camera distance)
                 if rel_pos[2] > camera.zoom * 100 + radius:
                     continue
-                dist = np.linalg.norm(rel_pos)
+                dist = math.sqrt(rel_pos[0]*rel_pos[0] + rel_pos[1]*rel_pos[1] + rel_pos[2]*rel_pos[2])
                 draw_spheres.append((rel_pos, radius, color, dist))
                 if label_text:
                     _show_lbl = False
@@ -31869,7 +32310,7 @@ def on_draw():
                 _skip_bonds = False
                 if p.is_atom:
                     _ab_rel = p.pos - camera.pos
-                    _ab_dist = np.linalg.norm(_ab_rel)
+                    _ab_dist = math.sqrt(float(_ab_rel[0]*_ab_rel[0] + _ab_rel[1]*_ab_rel[1] + _ab_rel[2]*_ab_rel[2]))
                     _ab_app = getattr(p, 'VIS_SHELL_R0', 15.0) / (_ab_dist + 1.0)
                     if _ab_app < 0.0001:
                         _skip_bonds = True
@@ -31882,7 +32323,7 @@ def on_draw():
             for rel_pos, radius, color, label_text, is_sub in _nt.get_draw_info(camera):
                 if rel_pos[2] > camera.zoom * 100 + radius:
                     continue
-                dist = np.linalg.norm(rel_pos)
+                dist = math.sqrt(rel_pos[0]*rel_pos[0] + rel_pos[1]*rel_pos[1] + rel_pos[2]*rel_pos[2])
                 draw_spheres.append((rel_pos, radius, color, dist))
                 if label_text and (_nt.show_unit_labels or toggle_particle_labels or toggle_atom_names_macro):
                     winx, winy, winz = gluProject(*rel_pos, model, proj, view)
@@ -32638,8 +33079,8 @@ def on_draw():
             _sb_rel = rotate_vector(_sb.pos - camera.pos, camera.rot)
             if not np.all(np.isfinite(_sb_rel)):
                 continue
-            _sb_dist = float(np.linalg.norm(_sb_rel))
-            if not math.isfinite(_sb_dist) or _sb_dist > 1e6 or _sb_dist < 0.01:
+            _sb_dist = math.sqrt(float(_sb_rel[0]*_sb_rel[0] + _sb_rel[1]*_sb_rel[1] + _sb_rel[2]*_sb_rel[2]))
+            if _sb_dist > 1e6 or _sb_dist < 0.01:
                 continue
             # Project to screen for tag label (always)
             try:
@@ -32651,26 +33092,34 @@ def on_draw():
             # Full shadow body only at macro zoom
             if camera.zoom < _SHADOW_VIS_ZOOM:
                 continue
-            _sb_h = max(1.0, _sb_dist * 0.08)
+            _sb_h = max(8.0, _sb_dist * 0.08)
             _sb_alpha = max(0, min(255, int(255 * _sb.teleport_alpha)))
             if _sb_alpha < 5:
                 continue
             # 3D volumetric humanoid rendering using GLU capsules
-            capsules, head_info, _sb_face, _sb_muscles, _sb_hair = _sb.get_3d_limbs(_sb_h)
+            # Cache geometry — regenerate only every 3 frames (hair/face/muscles are expensive)
+            _fc = frame_count
+            if (_sb._render_cache is None or
+                _fc - _sb._render_cache_frame >= 3 or
+                abs(_sb._render_cache_h - _sb_h) > 0.5):
+                _sb._render_cache = _sb.get_3d_limbs(_sb_h)
+                _sb._render_cache_frame = _fc
+                _sb._render_cache_h = _sb_h
+            capsules, head_info, _sb_face, _sb_muscles, _sb_hair = _sb._render_cache
             glPushMatrix()
             glTranslatef(float(_sb_rel[0]), float(_sb_rel[1]), float(_sb_rel[2]))
             glRotatef(math.degrees(_sb.heading), 0, 1, 0)
             glDepthMask(GL_FALSE)
-            # Skin tone body fill color (floor aura at 0.45 to prevent black silhouette)
+            # Skin tone body fill color — fixed brightness (no aura pulsing)
             _sk = _sb.skin_tone
-            _ai = max(0.45, _sb.aura_intensity if (_sb.aura_intensity == _sb.aura_intensity) else 0.5)
+            _ai = 0.75
             # Female skin rendered brighter/warmer for natural appearance
             _skin_bright = 0.78 if _sb.gender == 'female' else 0.65
             _skin_r = max(40, int(_sk[0] * _skin_bright * _ai))
             _skin_g = max(35, int(_sk[1] * _skin_bright * _ai))
             _skin_b = max(30, int(_sk[2] * _skin_bright * _ai))
             glColor4ub(_skin_r, _skin_g, _skin_b, _sb_alpha)
-            _sb_slices = 64
+            _sb_slices = max(8, min(24, int(16 * min(_sb_dist / 200.0, 1.0) + 8)))
             for _cx1, _cy1, _cx2, _cy2, _cr, _ck in capsules:
                 _cdx = _cx2 - _cx1
                 _cdy = _cy2 - _cy1
@@ -32693,7 +33142,7 @@ def on_draw():
                 glPushMatrix()
                 glTranslatef(_hcx, _hcy, 0)
                 glColor4ub(_skin_r, _skin_g, _skin_b, int(_sb_alpha * 0.85))
-                _draw_cached_sphere_abs(_hr, 64)
+                _draw_cached_sphere_abs(_hr, max(10, _sb_slices))
                 glPopMatrix()
             # Muscle rendering — flesh-toned bulges with anatomical coloring
             for _mx, _my, _mz, _mr, _mt in _sb_muscles:
@@ -32725,7 +33174,7 @@ def on_draw():
                     glColor4ub(max(0, _skin_r - 30), max(0, _skin_g - 35), max(0, _skin_b - 32), _sb_alpha)
                 else:
                     glColor4ub(min(255, _skin_r + 12), max(0, _skin_g - 5), max(0, _skin_b - 8), _sb_alpha)
-                _draw_cached_sphere_abs(_mr, 24)
+                _draw_cached_sphere_abs(_mr, max(8, _sb_slices // 2))
                 glPopMatrix()
             # Face detail features with proper skin/feature coloring
             _lc = _sb.lip_color
@@ -32767,7 +33216,7 @@ def on_draw():
                     glColor4ub(15, 12, 10, _sb_alpha)
                 else:
                     glColor4ub(_skin_r, _skin_g, _skin_b, _sb_alpha)
-                _draw_cached_sphere_abs(_fr, 24)
+                _draw_cached_sphere_abs(_fr, max(6, _sb_slices // 2))
                 glPopMatrix()
             # Hair rendering
             _hrc = _sb.hair_color
@@ -32815,9 +33264,10 @@ def on_draw():
                     glPushMatrix()
                     glTranslatef(_hcx + _nn[0] * _nn_scale, _hcy + _nn[1] * _nn_scale, _nn[2] * _nn_scale)
                     glColor4ub(100, 200, 255, _na_alpha)
-                    _draw_cached_sphere_abs(_nr, 8)
+                    _draw_cached_sphere_abs(_nr, 6)
                     glPopMatrix()
                 glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+            # Aura removed — was causing flashing circles around AI bodies
             glDepthMask(GL_TRUE)
             glPopMatrix()
         # Focus ghost rendering — translucent marker at each AI's analytical focus
@@ -32829,8 +33279,8 @@ def on_draw():
             _fg_rel = rotate_vector(_fgp - camera.pos, camera.rot)
             if not np.all(np.isfinite(_fg_rel)):
                 continue
-            _fg_dist = float(np.linalg.norm(_fg_rel))
-            if not math.isfinite(_fg_dist) or _fg_dist > 1e6 or _fg_dist < 0.01:
+            _fg_dist = math.sqrt(float(_fg_rel[0]*_fg_rel[0] + _fg_rel[1]*_fg_rel[1] + _fg_rel[2]*_fg_rel[2]))
+            if _fg_dist > 1e6 or _fg_dist < 0.01:
                 continue
             _fg_r = max(0.8, min(5.0, _fg_dist * 0.012))
             _fg_a = max(0, min(120, int(120 * _sb.teleport_alpha)))
@@ -32841,10 +33291,10 @@ def on_draw():
             glBlendFunc(GL_SRC_ALPHA, GL_ONE)
             # Outer glow
             glColor4ub(_sb.color[0], _sb.color[1], _sb.color[2], _fg_a // 3)
-            _draw_cached_sphere_abs(_fg_r * 2.5, 16)
+            _draw_cached_sphere_abs(_fg_r * 2.5, 8)
             # Inner core
             glColor4ub(_sb.color[0], _sb.color[1], _sb.color[2], _fg_a)
-            _draw_cached_sphere_abs(_fg_r, 16)
+            _draw_cached_sphere_abs(_fg_r, 8)
             glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
             glPopMatrix()
         glDisable(GL_BLEND)
@@ -32961,11 +33411,19 @@ def on_draw():
             glVertex3f(-_gnd_ext, 0.1, _gnd_i); glVertex3f(_gnd_ext, 0.1, _gnd_i)
             _gnd_i += _gnd_step
         glEnd()
-        capsules, head_info, _fb_face, _fb_muscles, _fb_hair = _fb.get_3d_limbs(_fh)
-        _fb_slices = 96
-        # Skin tone body fill (floor aura at 0.45 to prevent black silhouette)
+        # Cache geometry for preview panel (separate cache — different height than main 3D)
+        _fc = frame_count
+        if (_fb._preview_cache is None or
+            _fc - _fb._preview_cache_frame >= 3 or
+            abs(_fb._preview_cache_h - _fh) > 0.5):
+            _fb._preview_cache = _fb.get_3d_limbs(_fh)
+            _fb._preview_cache_frame = _fc
+            _fb._preview_cache_h = _fh
+        capsules, head_info, _fb_face, _fb_muscles, _fb_hair = _fb._preview_cache
+        _fb_slices = 32
+        # Skin tone body fill — fixed brightness (no aura pulsing)
         _fb_sk = _fb.skin_tone
-        _fb_ai = max(0.45, _fb.aura_intensity if (_fb.aura_intensity == _fb.aura_intensity) else 0.5)
+        _fb_ai = 0.75
         _fb_skin_bright = 0.78 if _fb.gender == 'female' else 0.65
         _fb_sr = max(45, int(_fb_sk[0] * _fb_skin_bright * _fb_ai))
         _fb_sg = max(38, int(_fb_sk[1] * _fb_skin_bright * _fb_ai))
@@ -32982,10 +33440,10 @@ def on_draw():
             _cang = math.degrees(math.atan2(_cdy, _cdx))
             glRotatef(_cang, 0, 0, 1)
             glRotatef(90, 0, 1, 0)
-            _draw_cached_cylinder(_cr, _clen, _fb_slices, 0.85)
-            _draw_cached_sphere_abs(_cr, _fb_slices)
+            _draw_cached_cylinder(_cr, _clen, 32, 0.85)
+            _draw_cached_sphere_abs(_cr, 32)
             glTranslatef(0, 0, _clen)
-            _draw_cached_sphere_abs(_cr * 0.85, _fb_slices)
+            _draw_cached_sphere_abs(_cr * 0.85, 32)
             glPopMatrix()
         # Head sphere (semi-transparent for neural vis)
         if head_info is not None:
@@ -32993,7 +33451,7 @@ def on_draw():
             glPushMatrix()
             glTranslatef(_hcx, _hcy, 0)
             glColor4ub(_fb_sr, _fb_sg, _fb_sb, 185)
-            _draw_cached_sphere_abs(_hr, 96)
+            _draw_cached_sphere_abs(_hr, 32)
             glPopMatrix()
         # Muscle rendering — flesh-toned bulges with anatomical coloring
         for _mx, _my, _mz, _mr, _mt in _fb_muscles:
@@ -33025,7 +33483,7 @@ def on_draw():
                 glColor4ub(max(0, _fb_sr - 30), max(0, _fb_sg - 35), max(0, _fb_sb - 32), 220)
             else:
                 glColor4ub(min(255, _fb_sr + 12), max(0, _fb_sg - 5), max(0, _fb_sb - 8), 220)
-            _draw_cached_sphere_abs(_mr, 32)
+            _draw_cached_sphere_abs(_mr, 24)
             glPopMatrix()
         # Face detail features with proper skin/feature coloring
         _fb_lc = _fb.lip_color
@@ -33067,7 +33525,7 @@ def on_draw():
                 glColor4ub(15, 12, 10, 220)
             else:
                 glColor4ub(_fb_sr, _fb_sg, _fb_sb, 220)
-            _draw_cached_sphere_abs(_fr, 48)
+            _draw_cached_sphere_abs(_fr, 24)
             glPopMatrix()
         # Hair rendering
         _fb_hrc = _fb.hair_color
@@ -33089,8 +33547,8 @@ def on_draw():
             _hang = math.degrees(math.acos(max(-1, min(1, _hndz))))
             if abs(_hndx) > 1e-6 or abs(_hndy) > 1e-6:
                 glRotatef(_hang, -_hndy, _hndx, 0)
-            _draw_cached_cylinder(_hrr, _hlen, 12, 0.6)
-            _draw_cached_sphere_abs(_hrr, 12)
+            _draw_cached_cylinder(_hrr, _hlen, 24, 0.6)
+            _draw_cached_sphere_abs(_hrr, 24)
             glPopMatrix()
         # Neural network visualization inside head (preview panel)
         if head_info is not None and _fb._neural_nodes:
@@ -33115,7 +33573,7 @@ def on_draw():
                 glPushMatrix()
                 glTranslatef(_hcx + _nn[0] * _nn_scale, _hcy + _nn[1] * _nn_scale, _nn[2] * _nn_scale)
                 glColor4ub(100, 200, 255, _na_alpha)
-                _draw_cached_sphere_abs(_nr, 12)
+                _draw_cached_sphere_abs(_nr, 24)
                 glPopMatrix()
             glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
         # Restore full viewport and 2D projection
@@ -33564,6 +34022,31 @@ def on_draw():
                 label = positron_labels[i]
                 label.x = positron_list_x + 10
                 label.y = positron_list_y + positron_list_height - (j + 1) * _line_h
+                label.font_size = int(12 * ui_scale)
+                label.draw()
+
+    if show_ai_body_list:
+        Rectangle(ai_body_list_x, ai_body_list_y, ai_body_list_width, ai_body_list_height,
+                  color=_TH_PANEL[:3]).draw()
+        Label('[SPACE] AI Bodies', x=ai_body_list_x + 8, y=ai_body_list_y + ai_body_list_height + 4,
+              font_size=10, color=_TH_TEXT_ACC).draw()
+        total_items = len(ai_body_labels)
+        if total_items > 0:
+            visible_lines = int(ai_body_list_height / _line_h)
+            max_scroll = max(0, total_items - visible_lines)
+            if max_scroll > 0:
+                thumb_height = max(16, ai_body_list_height * visible_lines / total_items)
+                thumb_y = ai_body_list_y + (ai_body_list_offset / max_scroll) * (ai_body_list_height - thumb_height)
+                Rectangle(ai_body_list_x + ai_body_list_width - 8, thumb_y, 8, thumb_height,
+                          color=_TH_SCROLL[:3]).draw()
+            visible_lines = min(visible_lines, total_items)
+            for j in range(visible_lines):
+                i = ai_body_list_offset + j
+                if i >= total_items:
+                    break
+                label = ai_body_labels[i]
+                label.x = ai_body_list_x + 10
+                label.y = ai_body_list_y + ai_body_list_height - (j + 1) * _line_h
                 label.font_size = int(12 * ui_scale)
                 label.draw()
 

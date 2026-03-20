@@ -537,6 +537,19 @@ except ImportError:
 
 import threading as _threading_mod
 
+# === JIT-Compiled Physics Engine (Numba -> native machine code) ===
+try:
+    from _fast_physics import (
+        SoACache as _SoACache, batch_physics_substep as _batch_physics_substep,
+        _batch_copy_prev_pos, _batch_expansion, _NUMBA_AVAILABLE as _FAST_PHYSICS_AVAILABLE,
+        _soa_cache as _fast_soa
+    )
+    print(f"[Physics] Fast physics engine loaded (JIT={_FAST_PHYSICS_AVAILABLE})")
+except ImportError as _fp_err:
+    print(f"[Physics] Fast physics not available: {_fp_err} — using pure Python")
+    _FAST_PHYSICS_AVAILABLE = False
+    _fast_soa = None
+
 # === Hardware Detection & GPU-First Adaptive Performance Governor ===
 # GPU-FIRST POLICY: GPU is the primary compute device. CPU is fallback only.
 # 1. Always use GPU for gravity, EM forces, and batch position updates when available.
@@ -3241,6 +3254,196 @@ def neutron_capture_cross_section_barn(Z, A):
     return max(base, 0.001)
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# Photon Physics: Wavelength↔RGB, Relativistic Doppler, Photonic Crystals
+# ══════════════════════════════════════════════════════════════════════════════
+
+def wavelength_to_rgb(wavelength_nm, intensity=1.0):
+    """Convert wavelength in nanometers to (R, G, B, A) tuple (0-255).
+    Uses CIE 1931 approximate piecewise-linear mapping for the visible spectrum
+    (380-780 nm). Outside visible range: UV→violet tint, IR→deep red tint,
+    with alpha fade for far-out-of-band photons (gamma, radio, etc.).
+    Ref: Dan Bruton's algorithm (www.physics.sfasu.edu/astro/color/spectra.html)
+    """
+    wl = wavelength_nm
+    R = G = B = 0.0
+    if wl < 10:
+        # Gamma / hard X-ray: faint violet
+        R, G, B = 0.4, 0.0, 0.6
+        intensity *= 0.3
+    elif wl < 380:
+        # UV: violet with fade-in as approaching visible
+        t = max(0.0, (wl - 10) / 370.0)
+        R, G, B = 0.4 + 0.1 * t, 0.0, 0.6 + 0.1 * t
+        intensity *= 0.4 + 0.6 * t
+    elif wl < 440:
+        R = -(wl - 440.0) / (440.0 - 380.0)
+        G = 0.0
+        B = 1.0
+    elif wl < 490:
+        R = 0.0
+        G = (wl - 440.0) / (490.0 - 440.0)
+        B = 1.0
+    elif wl < 510:
+        R = 0.0
+        G = 1.0
+        B = -(wl - 510.0) / (510.0 - 490.0)
+    elif wl < 580:
+        R = (wl - 510.0) / (580.0 - 510.0)
+        G = 1.0
+        B = 0.0
+    elif wl < 645:
+        R = 1.0
+        G = -(wl - 645.0) / (645.0 - 580.0)
+        B = 0.0
+    elif wl < 781:
+        R = 1.0
+        G = 0.0
+        B = 0.0
+    elif wl < 1e6:
+        # IR / microwave: deep red with fade
+        t = min(1.0, (wl - 780) / 5000.0)
+        R, G, B = 0.7 - 0.3 * t, 0.0, 0.0
+        intensity *= max(0.15, 1.0 - t * 0.85)
+    else:
+        # Radio: very faint red
+        R, G, B = 0.3, 0.0, 0.0
+        intensity *= 0.1
+    # Intensity fall-off at edges of visible range
+    if 380 <= wl < 420:
+        factor = 0.3 + 0.7 * (wl - 380.0) / 40.0
+    elif 700 < wl < 781:
+        factor = 0.3 + 0.7 * (780.0 - wl) / 80.0
+    elif 380 <= wl <= 700:
+        factor = 1.0
+    else:
+        factor = 1.0  # already handled above
+    R = min(1.0, R * factor * intensity)
+    G = min(1.0, G * factor * intensity)
+    B = min(1.0, B * factor * intensity)
+    return (int(R * 255), int(G * 255), int(B * 255), 255)
+
+
+def relativistic_doppler_wavelength(rest_wavelength, v_radial, v_source_speed=0.0):
+    """Compute observed wavelength via full relativistic Doppler effect.
+    rest_wavelength: emitted wavelength (m)
+    v_radial: radial velocity of source relative to observer (m/s).
+              Positive = receding (redshift), negative = approaching (blueshift).
+    v_source_speed: total speed of source for transverse Doppler (m/s).
+    Returns observed wavelength in meters.
+    Formula: λ_obs = λ_rest * sqrt(1 - β²) / (1 - β_r)
+    where β = v/c, β_r = v_radial/c (negative if approaching).
+    Ref: Einstein (1905), Special Relativity §7; Rybicki & Lightman §4.2
+    """
+    beta_r = max(-0.9999, min(0.9999, v_radial / c))
+    beta_total = min(0.9999, v_source_speed / c)
+    # Full relativistic: transverse + longitudinal
+    gamma_inv = math.sqrt(1.0 - beta_total * beta_total)
+    obs_wl = rest_wavelength * gamma_inv / (1.0 - beta_r)
+    return max(obs_wl, 1e-20)
+
+
+def gravitational_redshift_factor(M, r):
+    """Compute gravitational redshift factor: λ_obs/λ_emit = 1/sqrt(1 - r_s/r).
+    M: mass of gravitating body (kg), r: distance from center (m).
+    Returns factor >= 1.0 (redshift). For weak fields ≈ 1 + GM/(rc²).
+    Ref: Schwarzschild metric, MTW Gravitation §25.3
+    """
+    if M <= 0 or r <= 0:
+        return 1.0
+    r_s = 2.0 * G * M / (c * c)
+    if r <= r_s:
+        return 10.0  # Event horizon: extreme redshift (capped)
+    return 1.0 / math.sqrt(1.0 - r_s / r)
+
+
+# Toggle: visualize photon wavelengths/frequencies as spectral colors + wave overlay
+_show_photon_wavelengths = False
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Photonic Crystal Regions — slow light / stopped light / anomalous dispersion
+# Ref: Hau et al., Nature 397, 594 (1999) — light slowed to 17 m/s in BEC
+#      Bajcsy et al., Nature 426, 638 (2003) — stopped light in photonic crystal
+#      Joannopoulos et al., "Photonic Crystals: Molding the Flow of Light" (2008)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class PhotonicCrystal:
+    """A spatial region that modifies photon group velocity via refractive index
+    and/or photonic band structure. Photons inside experience:
+    - Reduced group velocity: v_g = c / n_eff (can be << c or even ~0 for stopped light)
+    - Preserved vacuum wavelength (λ_0) and frequency (ν = c/λ_0) — the photon's
+      intrinsic energy E = hν is unchanged. Only the *phase velocity* and *group velocity*
+      change inside the medium.
+    - Dispersion: n(λ) varies with wavelength (Cauchy/Sellmeier model)
+    """
+    _instances = []
+
+    def __init__(self, pos, radius, n_eff=1.5, bandgap_range=None, stopped=False, label=''):
+        """
+        pos: center position (3D numpy array)
+        radius: effective radius of the crystal region (sim units)
+        n_eff: effective refractive index at reference wavelength (550 nm)
+        bandgap_range: (λ_min_nm, λ_max_nm) — photonic bandgap blocks these wavelengths
+        stopped: if True, group velocity → 0 (EIT/slow-light regime)
+        label: display name
+        """
+        self.pos = np.array(pos, dtype=float)
+        self.radius = float(radius)
+        self.n_eff = float(n_eff)
+        self.bandgap_range = bandgap_range  # (min_nm, max_nm) or None
+        self.stopped = stopped
+        self.label = label or f"PhC(n={n_eff:.2f})"
+        # Cauchy dispersion coefficients: n(λ) = A + B/λ² + C/λ⁴
+        # Fitted so n(550nm) = n_eff, with typical glass-like dispersion
+        self.cauchy_A = n_eff * 0.97
+        self.cauchy_B = n_eff * 0.03 * (550e-9)**2
+        PhotonicCrystal._instances.append(self)
+
+    def refractive_index(self, wavelength_m):
+        """Wavelength-dependent refractive index via Cauchy dispersion.
+        Returns n(λ). Higher n at shorter wavelengths (normal dispersion).
+        """
+        if wavelength_m <= 0:
+            return self.n_eff
+        lam2 = wavelength_m * wavelength_m
+        return self.cauchy_A + self.cauchy_B / lam2
+
+    def is_inside(self, pos):
+        """Check if position is within this crystal region."""
+        return np.linalg.norm(pos - self.pos) <= self.radius
+
+    def is_bandgap_blocked(self, wavelength_nm):
+        """Check if wavelength falls in the photonic bandgap (Bragg reflection)."""
+        if self.bandgap_range is None:
+            return False
+        return self.bandgap_range[0] <= wavelength_nm <= self.bandgap_range[1]
+
+    def group_velocity(self, wavelength_m):
+        """Compute group velocity for a photon in this medium.
+        v_g = c / n_g where n_g = n - λ·(dn/dλ) is the group index.
+        For Cauchy: dn/dλ = -2B/λ³, so n_g = A + 3B/λ².
+        If stopped-light mode: v_g → 0 (photon is trapped).
+        """
+        if self.stopped:
+            return 0.0
+        if wavelength_m <= 0:
+            return c / self.n_eff
+        lam2 = wavelength_m * wavelength_m
+        n_group = self.cauchy_A + 3.0 * self.cauchy_B / lam2
+        n_group = max(n_group, 1.0)
+        return c / n_group
+
+    @classmethod
+    def find_crystal_at(cls, pos):
+        """Return the PhotonicCrystal containing pos, or None."""
+        for pc in cls._instances:
+            if pc.is_inside(pos):
+                return pc
+        return None
+
+photonic_crystals = []  # Active photonic crystal regions
+
+
 # Particle class - Enhanced for wavefunctions, entanglement, better decays, scales
 class Particle:
     instance_count = 0
@@ -3381,11 +3584,22 @@ class Particle:
         self.polarization = random.uniform(0, math.pi)  # Linear polarization angle
         self.detected = False  # True when measured/detected (wavefunction collapse)
         self.slit_path = -1  # -1=undetermined, 0=slit1, 1=slit2 (for double-slit)
+        # === Photon-specific physics (relativistic Doppler, media, photonic crystals) ===
+        self.rest_wavelength = 0.0       # Emitted wavelength in vacuum (m) — intrinsic, from E=hc/λ
+        self.observed_wavelength = 0.0   # Doppler+gravity shifted wavelength as seen by camera (m)
+        self.medium_n = 1.0              # Refractive index of current medium (1.0 = vacuum)
+        self.photon_group_vel = c        # Actual propagation speed (c in vacuum, c/n in medium)
+        self.in_photonic_crystal = None  # Reference to PhotonicCrystal if inside one, else None
+        self.photon_stopped = False      # True if trapped in stopped-light regime (EIT)
+        self.photon_v_emit = np.zeros(dims)  # Velocity of emitter at emission time (for Doppler)
         if bt in ('photon', 'gluon'):
             # Photon wavelength from energy: Î» = hc/E (set after energy is known)
             # Default to visible light (~550nm green) if no energy assigned
             self.wave_wavelength = 550e-9  # meters
             self.wave_frequency = c / self.wave_wavelength  # Hz
+            self.rest_wavelength = self.wave_wavelength
+            self.observed_wavelength = self.wave_wavelength
+            self.photon_group_vel = c
         elif self.mass > 0:
             # de Broglie: Î» = h/(mÂ·v), computed dynamically in update
             v_mag = np.linalg.norm(self.vel) if self.vel is not None else 0
@@ -3497,16 +3711,94 @@ class Particle:
         dt = PHYSICS_DT * time_factor
         bt = self.base_type
         if bt in ('photon', 'gluon'):
-            # Massless particles propagate at c, no forces
-            v_norm = np.linalg.norm(self.vel)
-            if v_norm > 0:
-                self.vel = c * (self.vel / v_norm)
-            self.pos += self.vel * dt
+            # ── Photonic crystal / medium interaction ──
+            # Check if photon is inside a photonic crystal region
+            _pc = PhotonicCrystal.find_crystal_at(self.pos)
+            _prev_pc = self.in_photonic_crystal
+            self.in_photonic_crystal = _pc
+            _wl_m = self.rest_wavelength if self.rest_wavelength > 0 else 550e-9
+
+            if _pc is not None:
+                # Bandgap check: Bragg-reflect photons whose wavelength is in the gap
+                _wl_nm = _wl_m * 1e9
+                if _pc.is_bandgap_blocked(_wl_nm):
+                    # Reflect: reverse direction (Bragg reflection at photonic bandgap)
+                    self.vel = -self.vel
+                    self.in_photonic_crystal = None
+                else:
+                    # Compute medium refractive index and group velocity
+                    self.medium_n = _pc.refractive_index(_wl_m)
+                    self.photon_group_vel = _pc.group_velocity(_wl_m)
+                    self.photon_stopped = _pc.stopped
+            else:
+                # Vacuum: n=1, speed=c
+                self.medium_n = 1.0
+                self.photon_group_vel = c
+                self.photon_stopped = False
+
+            # ── Propagation: speed = group velocity in current medium ──
+            # Photon energy E = hν is ALWAYS preserved — only speed changes in medium
+            # The vacuum wavelength λ₀ and frequency ν = c/λ₀ are intrinsic properties
+            if not self.photon_stopped:
+                v_norm = np.linalg.norm(self.vel)
+                _target_speed = self.photon_group_vel
+                if v_norm > EPSILON:
+                    self.vel = _target_speed * (self.vel / v_norm)
+                elif _target_speed > EPSILON:
+                    # Photon resuming from stopped state: pick random direction
+                    self.vel = _target_speed * random_unit_vector()
+                self.pos += self.vel * dt
+            # else: photon is stopped (EIT) — position does not change, energy preserved
+
             self.pos = np.nan_to_num(self.pos)
-            # Evolve quantum wave phase: Ï† += 2Ï€Â·fÂ·dt where f = E/h
+
+            # ── Wavelength / frequency from energy (Planck-Einstein) ──
             if self.energy_kin > 0:
-                self.wave_wavelength = h * c / (self.energy_kin + EPSILON)
+                self.rest_wavelength = h * c / (self.energy_kin + EPSILON)
+                self.wave_wavelength = self.rest_wavelength
                 self.wave_frequency = self.energy_kin / h
+
+            # ── Gravitational redshift from nearby massive particles ──
+            # λ_obs = λ_emit * 1/sqrt(1 - r_s/r) for each massive neighbor
+            _grav_z_factor = 1.0
+            _grav_accel_mag = np.linalg.norm(grav_accel)
+            if _grav_accel_mag > EPSILON:
+                # Approximate: use grav_accel to estimate local Φ/c²
+                # For uniform-ish field: Δλ/λ ≈ g·Δr/c² (pound-rebka style)
+                # We use the accumulated gravitational potential from Barnes-Hut
+                # More accurate: check nearest massive particle
+                for p in particles:
+                    if p is self or p.mass < 1e-20:
+                        continue
+                    _r_vec = self.pos - p.pos
+                    _r_dist = math.sqrt(_r_vec[0]*_r_vec[0] + _r_vec[1]*_r_vec[1] + _r_vec[2]*_r_vec[2])
+                    if _r_dist < EPSILON or _r_dist > 1e6:
+                        continue
+                    _grf = gravitational_redshift_factor(p.mass, _r_dist)
+                    _grav_z_factor *= _grf
+                    if _grav_z_factor > 5.0:
+                        _grav_z_factor = 5.0
+                        break
+
+            # ── Relativistic Doppler shift (observed wavelength from camera frame) ──
+            # v_radial: component of photon velocity toward/away from camera
+            # Positive v_radial = receding from camera → redshift
+            _cam_pos = camera.pos if 'camera' in dir() else np.zeros(dims)
+            _to_cam = _cam_pos - self.pos
+            _to_cam_dist = np.linalg.norm(_to_cam)
+            if _to_cam_dist > EPSILON:
+                _to_cam_hat = _to_cam / _to_cam_dist
+                # Radial velocity: positive = approaching camera (blueshift)
+                _v_radial = -np.dot(self.vel, _to_cam_hat)
+                _v_speed = np.linalg.norm(self.vel)
+                _obs_wl = relativistic_doppler_wavelength(
+                    self.rest_wavelength * _grav_z_factor,
+                    _v_radial, _v_speed)
+                self.observed_wavelength = _obs_wl
+            else:
+                self.observed_wavelength = self.rest_wavelength * _grav_z_factor
+
+            # ── Evolve quantum wave phase: φ += 2π·f·dt where f = E/h ──
             self.wave_phase = (self.wave_phase + 2 * math.pi * self.wave_frequency * dt) % (2 * math.pi)
             # Decoherence: interactions reduce coherence over time
             if self.wave_coherence > 0 and self.detected:
@@ -3514,7 +3806,7 @@ class Particle:
             return
         if self.mass <= 0 or bt == 'decayed':
             return  # Skip decayed particles
-        # In-atom sub-particles are handled by Atom.update() â€” skip expensive pairwise
+        # In-atom sub-particles are handled by Atom.update() — skip expensive pairwise
         if self.in_atom or self.in_nanotech:
             return
 
@@ -3873,6 +4165,22 @@ class Particle:
                 q_size = max(0.25, self.PARTICLE_RADII.get(q_bt, 0.03) * 8.0)
                 result.append((q_rel, q_size, q_color, q_bt, True))
             return result
+        # Photon spectral coloring when wavelength viz is active
+        if _show_photon_wavelengths and bt in ('photon', 'gluon'):
+            _obs_wl = getattr(self, 'observed_wavelength', 0)
+            if _obs_wl > 0:
+                _wl_nm = _obs_wl * 1e9  # convert m -> nm
+            else:
+                _wl_nm = getattr(self, 'rest_wavelength', 550e-9) * 1e9
+            _srgba = wavelength_to_rgb(_wl_nm)
+            _sr, _sg, _sb = _srgba[0], _srgba[1], _srgba[2]
+            # Brightness modulated by coherence (dim = decoherent)
+            _coh = getattr(self, 'wave_coherence', 1.0)
+            _bright = 0.4 + 0.6 * _coh
+            _spec_color = (int(_sr * _bright), int(_sg * _bright), int(_sb * _bright), 255)
+            # Slightly larger photon when in wavelength viz mode for visibility
+            _psize = max(size * 1.5, 0.8)
+            return [(rel_pos, _psize, _spec_color, bt, False)]
         return [(rel_pos, size, self.color, bt, False)]
 
     def get_bonds(self, camera):
@@ -11816,6 +12124,7 @@ if _observer_mgr is not None:
 _shadow_bodies_visible = True   # [ key toggles visibility
 _shadow_outline_white = False  # ] key toggles white vs colored outlines
 _show_aura = False             # Aura rendering removed — toggle kept for compatibility
+_show_photon_wavelengths = False  # Shift+W: spectral color + Doppler/redshift wavelength viz for photons
 _shadow_focus_idx = -1         # \ key cycles focus on shadow bodies (-1 = none)
 _shadow_focus_orbit = 0.0      # manual orbit angle (degrees) via middle-click drag
 _shadow_focus_tilt = 0.0       # manual tilt angle (degrees) via up/down arrow keys
@@ -29407,6 +29716,67 @@ for _ct in _f1_col_texts:
     f1_col_labels.append(Label(_ct, x=0, y=0, font_size=9, color=(200, 210, 220, 255),
                                anchor_x='left', anchor_y='top', multiline=True, width=200))
 
+# --- Multi-column helpers for F1 pages 1-7 ---
+_f1_page_col_cache = {}
+
+def _f1_split_columns(lines, ncols):
+    """Split a list of text lines into ncols balanced column strings,
+    preferring to break at section headers (=== or ---) or empty lines."""
+    if not lines:
+        return [''] * ncols
+    total = len(lines)
+    if total <= ncols:
+        return [chr(10).join(lines)] + [''] * (ncols - 1)
+    target = total / ncols
+    breaks = []
+    for i, line in enumerate(lines):
+        if i > 0 and (line.startswith('===') or line.startswith('---')):
+            breaks.append(i)
+    cols = []
+    start = 0
+    for col_i in range(ncols - 1):
+        ideal = start + target
+        best = None
+        best_dist = float('inf')
+        for b in breaks:
+            if b > start and abs(b - ideal) < best_dist:
+                best_dist = abs(b - ideal)
+                best = b
+        if best is None or best_dist > target * 0.5:
+            fallback = int(ideal)
+            for j in range(max(start + 1, fallback - 5), min(total, fallback + 6)):
+                if lines[j] == '':
+                    fallback = j + 1
+                    break
+            best = fallback
+        best = max(start + 1, min(best, total - 1))
+        cols.append(chr(10).join(lines[start:best]))
+        start = best
+    cols.append(chr(10).join(lines[start:]))
+    return cols
+
+def _f1_draw_columns(lines, ncols, cache_key, px, py, pw, ph):
+    """Render lines in ncols balanced columns with dividers inside an F1 page."""
+    col_pad = 8
+    col_w = (pw - (ncols + 1) * col_pad) // ncols
+    col_top = py + ph - 35
+    col_txts = _f1_split_columns(lines, ncols)
+    if cache_key not in _f1_page_col_cache or len(_f1_page_col_cache[cache_key]) != ncols:
+        _f1_page_col_cache[cache_key] = [
+            Label('', font_size=9, color=_TH_TEXT, multiline=True,
+                  width=200, anchor_x='left', anchor_y='top') for _ in range(ncols)]
+    col_lbls = _f1_page_col_cache[cache_key]
+    for ci, clbl in enumerate(col_lbls):
+        clbl.text = col_txts[ci]
+        clbl.x = px + col_pad + ci * (col_w + col_pad)
+        clbl.y = col_top
+        clbl.width = col_w
+        clbl.font_size = 9
+        clbl.draw()
+    for ci in range(1, ncols):
+        div_x = px + col_pad + ci * (col_w + col_pad) - col_pad // 2
+        PygletLine(div_x, col_top, div_x, py + 25, color=_TH_TEXT_DIM[:3]).draw()
+
 # === UI Theme: dark, muted, easy on the eyes ===
 _TH_BG = (18, 18, 24, 200)          # Dark blue-black semi-transparent
 _TH_BAR_BG = (40, 42, 54, 255)      # Muted dark gray
@@ -29422,6 +29792,53 @@ _TH_BTN_TEXT = (240, 240, 240, 255) # Button text
 _TH_POPUP = (30, 32, 44, 240)       # Popup bg
 _TH_FOCUS = (180, 200, 255, 255)    # Focus label (light blue)
 _TH_WARN = (255, 200, 100, 255)     # Warning/active (warm amber)
+
+# === Panel Exclusivity System ===
+# Panel categories for window management.
+# Default: only ONE panel open at a time.  Hold Shift when pressing a hotkey
+# to keep existing panels open (multi-panel mode) â€” then drag title bars to
+# reposition so they don't overlap.
+_FULLSCREEN_PANELS = [
+    'show_info_overlay', 'show_menu', 'show_sphere_nav', 'show_sphere_map',
+    'show_mandelbrot_map', 'show_sound_panel', 'show_nanotech_list',
+    'show_molecules_panel', 'show_life_forms_list', 'show_spectrum_panel',
+]
+_SIDE_PANELS = ['show_observer_panel', 'show_ai_dashboard', 'show_history']
+_LIST_PANELS = [
+    'show_particle_list', 'show_atom_list', 'show_positron_list',
+    'show_ai_body_list', 'show_nanotech_focus_list', 'show_molecule_focus_list',
+]
+_ALL_PANELS = _FULLSCREEN_PANELS + _SIDE_PANELS + _LIST_PANELS
+
+# Draggable panel positions: panel_name -> (x, y) offset from default
+_panel_drag_pos = {}
+_panel_dragging = None        # panel_name currently being dragged
+_panel_drag_offset = (0, 0)   # mouse offset from panel corner when drag started
+_PANEL_TITLE_BAR_H = 34       # height of draggable title bar region
+# Live panel rects updated each frame: panel_name -> (x, y, w, h)
+_panel_rects = {}
+
+def _panel_apply_drag(name, x, y, w, h):
+    """Apply saved drag offset to panel position and register rect for hit testing.
+    Returns adjusted (x, y, w, h)."""
+    dx, dy = _panel_drag_pos.get(name, (0, 0))
+    nx, ny = x + dx, y + dy
+    # Clamp to screen bounds so panels can't be dragged completely off-screen
+    nx = max(-w + 40, min(WIDTH - 40, nx))
+    ny = max(-h + 40, min(HEIGHT - 40, ny))
+    _panel_rects[name] = (nx, ny, w, h)
+    return nx, ny, w, h
+
+def _close_other_panels(opening, keep_open=False):
+    """Close ALL other panels when opening a new one (single-window mode).
+    If keep_open is True (Shift held), skip closing so multiple panels coexist.
+    """
+    if keep_open:
+        return
+    g = globals()
+    for p in _ALL_PANELS:
+        if p != opening:
+            g[p] = False
 
 # UI elements initialization
 show_ui = True  # F9 toggles entire top UI bar visibility
@@ -29596,11 +30013,13 @@ def on_key_press(symbol, modifiers):
     global show_spectrum_panel, _ai_dashboard_tab, _ai_chat_input_active, _ai_chat_input_text
     global _ai_os_input_blocked, _ai_os_confirm_prompt
     global _gna_confirm_prompt, _gna_show_terminal, _gna_running, _gna_browser_control
+    global _show_photon_wavelengths
     if _controls_capturing >= 0 and show_controls_panel and show_menu:
         if symbol == pyglet.window.key.ESCAPE:
             _controls_capturing = -1
             return True
         _aid = _HOTKEY_ACTIONS[_controls_capturing][0]
+        # ... (rest of the code remains the same)
         hotkey_map[_aid] = symbol
         _controls_capturing = -1
         _save_hotkeys()
@@ -29904,17 +30323,43 @@ def on_key_press(symbol, modifiers):
         elif symbol == pyglet.window.key.ESCAPE or symbol == hotkey_map.get('observer'):
             show_observer_panel = False
             return
+    # --- F1 info overlay open: handle tab keys, ESC to close, absorb rest ---
+    if show_info_overlay:
+        if symbol == pyglet.window.key.ESCAPE or symbol == hotkey_map.get('f1_info'):
+            show_info_overlay = False
+            return True
+        if symbol == pyglet.window.key._1:
+            _f1_page = 0; return True
+        elif symbol == pyglet.window.key._2:
+            _f1_page = 1; return True
+        elif symbol == pyglet.window.key._3:
+            _f1_page = 2; return True
+        elif symbol == pyglet.window.key._4:
+            _f1_page = 3; return True
+        elif symbol == pyglet.window.key._5:
+            _f1_page = 4; return True
+        elif symbol == pyglet.window.key._6:
+            _f1_page = 5; return True
+        elif symbol == pyglet.window.key._7:
+            _f1_page = 6; return True
+        elif symbol == pyglet.window.key._8:
+            _f1_page = 7; return True
+        elif symbol == pyglet.window.key.LEFT:
+            _f1_page = max(0, _f1_page - 1); return True
+        elif symbol == pyglet.window.key.RIGHT:
+            _f1_page = min(7, _f1_page + 1); return True
+        return True  # Absorb all other keys while F1 overlay is open
     # --- Normal key handling ---
     if symbol == pyglet.window.key.ESCAPE:
         show_menu = not show_menu
         show_info = False
+        if show_menu:
+            _close_other_panels('show_menu', keep_open=False)
         return True
     elif symbol == hotkey_map.get('pause'):
         paused = not paused
         if paused:
             _pause_start_time = time.time()
-        if not paused:
-            physics_accumulator = 0.0
     elif symbol == hotkey_map.get('place_particle'):
         # Toggle particle-type selection list
         show_ptype_list = not show_ptype_list
@@ -30081,6 +30526,7 @@ def on_key_press(symbol, modifiers):
     elif symbol == hotkey_map.get('f1_info'):
         show_info_overlay = not show_info_overlay
         if show_info_overlay:
+            _close_other_panels('show_info_overlay', keep_open=bool(modifiers & pyglet.window.key.MOD_SHIFT))
             _f1_scroll_offset = 0
     elif symbol == hotkey_map.get('f2_em'):
         toggle_em_field = not toggle_em_field
@@ -30094,6 +30540,8 @@ def on_key_press(symbol, modifiers):
         toggle_radiation_density = not toggle_radiation_density
     elif symbol == hotkey_map.get('f7_sphere'):
         show_sphere_nav = not show_sphere_nav
+        if show_sphere_nav:
+            _close_other_panels('show_sphere_nav', keep_open=bool(modifiers & pyglet.window.key.MOD_SHIFT))
         if not show_sphere_nav:
             sphere_nav_frozen = False
             _sphere_snap_idx = -1
@@ -30103,6 +30551,8 @@ def on_key_press(symbol, modifiers):
             _sphere_nav_interp_t = 0.0
     elif symbol == hotkey_map.get('f8_map'):
         show_sphere_map = not show_sphere_map
+        if show_sphere_map:
+            _close_other_panels('show_sphere_map', keep_open=bool(modifiers & pyglet.window.key.MOD_SHIFT))
     elif symbol == hotkey_map.get('camera_window'):
         # C: Defer spawn of camera window to next update() to avoid
         # "Set changed size during iteration" when pyglet iterates windows
@@ -30110,18 +30560,28 @@ def on_key_press(symbol, modifiers):
     elif symbol == hotkey_map.get('observer'):
         # ;: Toggle AI Observer consciousness panel
         show_observer_panel = not show_observer_panel
-        if show_observer_panel and _observer_mgr:
-            _observer_panel_highlight = _observer_mgr.selected_idx
+        if show_observer_panel:
+            _close_other_panels('show_observer_panel', keep_open=bool(modifiers & pyglet.window.key.MOD_SHIFT))
+            if _observer_mgr:
+                _observer_panel_highlight = _observer_mgr.selected_idx
     elif symbol == hotkey_map.get('f9_hideui'):
         show_ui = not show_ui
     elif symbol == hotkey_map.get('f10_sound'):
         show_sound_panel = not show_sound_panel
+        if show_sound_panel:
+            _close_other_panels('show_sound_panel', keep_open=bool(modifiers & pyglet.window.key.MOD_SHIFT))
     elif symbol == pyglet.window.key.F10 and (modifiers & pyglet.window.key.MOD_SHIFT):
         show_spectrum_panel = not show_spectrum_panel
+        if show_spectrum_panel:
+            _close_other_panels('show_spectrum_panel', keep_open=bool(modifiers & pyglet.window.key.MOD_SHIFT))
     elif symbol == hotkey_map.get('f11_nanotech'):
         show_nanotech_list = not show_nanotech_list
+        if show_nanotech_list:
+            _close_other_panels('show_nanotech_list', keep_open=bool(modifiers & pyglet.window.key.MOD_SHIFT))
     elif symbol == hotkey_map.get('f12_molecules'):
         show_molecules_panel = not show_molecules_panel
+        if show_molecules_panel:
+            _close_other_panels('show_molecules_panel', keep_open=bool(modifiers & pyglet.window.key.MOD_SHIFT))
     elif symbol == hotkey_map.get('toggle_labels'):
         toggle_particle_labels = not toggle_particle_labels
     elif symbol == hotkey_map.get('toggle_names'):
@@ -30137,6 +30597,7 @@ def on_key_press(symbol, modifiers):
         show_nanotech_focus_list = not show_nanotech_focus_list
         _nanotech_focus_scroll = 0
         if show_nanotech_focus_list:
+            _close_other_panels('show_nanotech_focus_list', keep_open=bool(modifiers & pyglet.window.key.MOD_SHIFT))
             if _nanotech_focus_idx < 0 and nanotech_loaded:
                 _nanotech_focus_idx = 0  # auto-select first if none selected
             if nanotech_loaded:
@@ -30157,6 +30618,7 @@ def on_key_press(symbol, modifiers):
         show_molecule_focus_list = not show_molecule_focus_list
         _molecule_focus_scroll = 0
         if show_molecule_focus_list:
+            _close_other_panels('show_molecule_focus_list', keep_open=bool(modifiers & pyglet.window.key.MOD_SHIFT))
             _spawned_molecules[:] = [m for m in _spawned_molecules if any(a in particles for a in m)]
             if _molecule_focus_idx < 0 and _spawned_molecules:
                 _molecule_focus_idx = 0  # auto-select first if none selected
@@ -30214,16 +30676,21 @@ def on_key_press(symbol, modifiers):
             life_forms_scroll = 0
             if show_life_forms_list:
                 life_forms_highlight = 0
+                _close_other_panels('show_life_forms_list', keep_open=bool(modifiers & pyglet.window.key.MOD_SHIFT))
     elif symbol == hotkey_map.get('mandelbrot_grid'):
         toggle_mandelbrot_grid = not toggle_mandelbrot_grid
         _mandelbrot_3d_cache = None
         _mandelbrot_3d_cache_key = None
     elif symbol == hotkey_map.get('mandelbrot_map'):
         show_mandelbrot_map = not show_mandelbrot_map
+        if show_mandelbrot_map:
+            _close_other_panels('show_mandelbrot_map', keep_open=bool(modifiers & pyglet.window.key.MOD_SHIFT))
         _mandelbrot_cache = None
         _mandelbrot_cache_key = None
     elif symbol == hotkey_map.get('ai_dashboard'):
         show_ai_dashboard = not show_ai_dashboard
+        if show_ai_dashboard:
+            _close_other_panels('show_ai_dashboard', keep_open=bool(modifiers & pyglet.window.key.MOD_SHIFT))
         _ai_dashboard_scroll = 0
     elif symbol == hotkey_map.get('afk_timer'):
         if modifiers & pyglet.window.key.MOD_SHIFT:
@@ -30244,6 +30711,10 @@ def on_key_press(symbol, modifiers):
         _shadow_outline_white = not _shadow_outline_white
     elif symbol == pyglet.window.key.A and (modifiers & pyglet.window.key.MOD_SHIFT):
         _show_aura = not _show_aura
+    elif symbol == pyglet.window.key.W and (modifiers & pyglet.window.key.MOD_SHIFT):
+        _show_photon_wavelengths = not _show_photon_wavelengths
+        _st = 'ON — spectral colors + Doppler shift visible' if _show_photon_wavelengths else 'OFF'
+        focus_label.text = f'Photon Wavelength Viz: {_st}'
     elif symbol == hotkey_map.get('shadow_focus'):
         if _shadow_bodies:
             if _shadow_focus_idx < 0:
@@ -30352,6 +30823,8 @@ def on_key_press(symbol, modifiers):
         time_input_text = ""
     elif symbol == hotkey_map.get('history'):
         show_history = not show_history
+        if show_history:
+            _close_other_panels('show_history', keep_open=bool(modifiers & pyglet.window.key.MOD_SHIFT))
     elif (modifiers & pyglet.window.key.MOD_CTRL) and symbol in (
             pyglet.window.key._1, pyglet.window.key._2, pyglet.window.key._3,
             pyglet.window.key._4, pyglet.window.key._5, pyglet.window.key._6,
@@ -30452,18 +30925,32 @@ def on_mouse_press(x, y, button, modifiers):
     global _sphere_snap_idx, _sphere_nav_time_frac, time_factor, _mol_spawn_qty
     global placement_click_pos, _f1_page, nanotech_highlight, _nanotech_focus_scroll
     global _molecule_focus_scroll, _sound_master_vol
+    global _panel_dragging, _panel_drag_offset
+
+    # --- Panel title-bar drag detection (before other panel click handling) ---
+    if button == pyglet.window.mouse.LEFT and _panel_rects:
+        for _pname, (_prx, _pry, _prw, _prh) in _panel_rects.items():
+            # Title bar is top _PANEL_TITLE_BAR_H pixels of the panel
+            _tb_y = _pry + _prh - _PANEL_TITLE_BAR_H
+            if _prx <= x <= _prx + _prw and _tb_y <= y <= _pry + _prh:
+                _panel_dragging = _pname
+                _cur_off = _panel_drag_pos.get(_pname, (0, 0))
+                _panel_drag_offset = (x - _prx + _cur_off[0], y - _pry + _cur_off[1])
+                return  # Absorb click — start drag
+
     # F1 page tab buttons
-    if show_info:
+    if show_info_overlay:
         _f1_px = int(WIDTH * 0.01)
         _f1_py = int(HEIGHT * 0.02)
-        _f1_btn_y = _f1_py + 8
-        _f1_btn_w = 72
-        _f1_btn_h = 20
+        _f1_btn_y = _f1_py + 10
+        _f1_btn_w = 88
+        _f1_btn_h = 28
         for _pi in range(8):
-            _bx = _f1_px + 10 + _pi * (_f1_btn_w + 4)
+            _bx = _f1_px + 10 + _pi * (_f1_btn_w + 6)
             if _bx <= x <= _bx + _f1_btn_w and _f1_btn_y <= y <= _f1_btn_y + _f1_btn_h:
                 _f1_page = _pi
                 return
+        return  # Absorb clicks inside F1 overlay
     # AI Dashboard tab click handling
     if show_ai_dashboard and _observer_mgr and _OBSERVER_AVAILABLE:
         _ai_w = min(720, WIDTH - 30)
@@ -31204,7 +31691,9 @@ def on_mouse_press(x, y, button, modifiers):
 @window.event
 def on_mouse_release(x, y, button, modifiers):
     global dragging, panning, particle_thumb_dragging, cluster_thumb_dragging, atom_thumb_dragging, positron_thumb_dragging, ai_body_thumb_dragging
+    global _panel_dragging
     if button == pyglet.window.mouse.LEFT:
+        _panel_dragging = None
         dragging = False
         particle_thumb_dragging = False
         cluster_thumb_dragging = False
@@ -31218,6 +31707,11 @@ def on_mouse_release(x, y, button, modifiers):
 @window.event
 def on_mouse_drag(x, y, dx, dy, buttons, modifiers):
     global dragging, panning, particle_thumb_dragging, cluster_thumb_dragging, atom_thumb_dragging, positron_thumb_dragging, ai_body_thumb_dragging, _shadow_focus_orbit
+    # --- Panel dragging ---
+    if _panel_dragging is not None:
+        _cur = _panel_drag_pos.get(_panel_dragging, (0, 0))
+        _panel_drag_pos[_panel_dragging] = (_cur[0] + dx, _cur[1] + dy)
+        return
     if particle_thumb_dragging:
         # handle drag
         line_height = int(22 * ui_scale)
@@ -31543,19 +32037,51 @@ def update(dt):
             steps_done = 0
             _substep_t0 = time.perf_counter()
             _substep_budget = _perf.substep_budget  # Adaptive wall-clock budget from performance governor
+            # === JIT BATCH PATH: compile pairwise forces + Verlet to machine code ===
+            _use_jit = _FAST_PHYSICS_AVAILABLE and _fast_soa is not None and _n_parts >= 2
+            if _use_jit:
+                _fast_soa.sync_from_particles(all_particles)
+                _physics_constants = {
+                    'k_e': k_e, 'mu_0': mu_0, 'strong_g2': strong_g2,
+                    'strong_lambda': strong_lambda, 'nuclear_range': nuclear_range,
+                    'c': c, 'EPSILON': EPSILON, 'bound': bound,
+                }
             while physics_accumulator >= PHYSICS_DT and steps_done < _adaptive_max:
-                # Snapshot prev_pos before each step so interpolation uses last completed step
-                for p in all_particles:
-                    p.prev_pos = p.pos.copy()
-                    if p.is_atom:
-                        for _sp in p.sub_particles:
-                            _sp.prev_pos = _sp.pos.copy()
-                            for _q in _sp.constituent_quarks:
-                                _q.prev_pos = _q.pos.copy()
-                for idx, p in enumerate(all_particles):
-                    if p in particle_set:
-                        ga = grav_accels[idx] if idx < n_grav else _zero_accel
-                        p.update(all_particles, effective_time_factor, ga, em_on_gpu=_em_on_gpu)
+                if _use_jit:
+                    # -- JIT batch: pairwise forces + Verlet as native machine code --
+                    _dt_step = PHYSICS_DT * effective_time_factor
+                    _batch_copy_prev_pos(_fast_soa.positions[:_fast_soa.n],
+                                         _fast_soa.prev_positions[:_fast_soa.n],
+                                         _fast_soa.n)
+                    # Snapshot prev_pos for atoms (sub-particles handled by Atom.update)
+                    for p in all_particles:
+                        if p.is_atom:
+                            p.prev_pos = p.pos.copy()
+                            for _sp in p.sub_particles:
+                                _sp.prev_pos = _sp.pos.copy()
+                                for _q in _sp.constituent_quarks:
+                                    _q.prev_pos = _q.pos.copy()
+                    _batch_physics_substep(
+                        _fast_soa, grav_accels, _dt_step, _physics_constants,
+                        em_on_gpu=_em_on_gpu)
+                    # Atoms: use Python update for complex internal dynamics
+                    for idx, p in enumerate(all_particles):
+                        if p.is_atom and p in particle_set:
+                            ga = grav_accels[idx] if idx < n_grav else _zero_accel
+                            p.update(all_particles, effective_time_factor, ga, em_on_gpu=_em_on_gpu)
+                else:
+                    # -- Fallback: pure Python per-particle update --
+                    for p in all_particles:
+                        p.prev_pos = p.pos.copy()
+                        if p.is_atom:
+                            for _sp in p.sub_particles:
+                                _sp.prev_pos = _sp.pos.copy()
+                                for _q in _sp.constituent_quarks:
+                                    _q.prev_pos = _q.pos.copy()
+                    for idx, p in enumerate(all_particles):
+                        if p in particle_set:
+                            ga = grav_accels[idx] if idx < n_grav else _zero_accel
+                            p.update(all_particles, effective_time_factor, ga, em_on_gpu=_em_on_gpu)
                 physics_accumulator -= PHYSICS_DT
                 steps_done += 1
                 # Break early if wall-clock budget exceeded (prioritize frame rate)
@@ -31578,6 +32104,9 @@ def update(dt):
                         if not _mid_gpu_ok:
                             grav_accels = GravAccel(_mid_pos, all_masses, thetamax=_bh_theta, G=G)
                         n_grav = len(grav_accels)
+            # Sync JIT results back to particle objects after all substeps
+            if _use_jit and steps_done > 0:
+                _fast_soa.sync_to_particles(all_particles)
             # Interpolation alpha: fraction of next physics step elapsed [0,1)
             # 0 = render at prev_pos (last completed step), approaching 1 = render at pos
             _render_alpha = physics_accumulator / PHYSICS_DT if PHYSICS_DT > 0 else 0.0
@@ -31667,7 +32196,7 @@ def update(dt):
 
             # == GLOBAL NaN FIREWALL — sanitize all particles periodically ==
             # Catches corruption from any source (GPU, pairwise, integrator)
-            if steps_done > 0 and frame_count % 10 == 0:
+            if steps_done > 0 and frame_count % 30 == 0:
                 for _fp in all_particles:
                     if getattr(_fp, 'base_type', '') == 'decayed':
                         continue
@@ -31720,6 +32249,7 @@ def update(dt):
             # Skip culling during reverse to preserve particle count
             # Merged: count atoms in same pass to avoid redundant iteration
             _pre_atoms = 0
+            _atom_list_merged = []  # Merged: collect atom list during cull to skip second pass
             if not _is_reverse_live:
                 # No hard particle cap — unlimited atoms and spatial expansion supported
                 cull_dist = max(5000.0, 2000.0 * camera.zoom)
@@ -31734,6 +32264,7 @@ def update(dt):
                         to_remove.append(p)
                     elif p.is_atom and bt != 'decayed':
                         _pre_atoms += 1
+                        _atom_list_merged.append(p)
                 if to_remove:
                     _remove_set = set(to_remove)
                     if selected_particle in _remove_set:
@@ -31780,13 +32311,9 @@ def update(dt):
             # History event logging (skip atom counting in reverse — never used)
             _post_n = len(particles)
             if not _is_reverse_live:
-                # Single pass: count atoms AND collect atom list simultaneously
-                _post_atoms = 0
-                _atom_list = []
-                for p in particles:
-                    if p.is_atom and getattr(p, 'base_type', '') != 'decayed':
-                        _post_atoms += 1
-                        _atom_list.append(p)
+                # Reuse atom list from merged cull pass — no second iteration needed
+                _post_atoms = sum(1 for p in _atom_list_merged if p in set(particles))
+                _atom_list = [p for p in _atom_list_merged if p in set(particles)]
                 if _post_atoms > _pre_atoms:
                     _names = [f"{atom_data.get(a.Z, {}).get('symbol', '?')}-{getattr(a, 'A', '?')}" for a in _atom_list[-(_post_atoms - _pre_atoms):]]
                     _history_log.append((simulation_time, f"Atom formed: {', '.join(_names)}"))
@@ -32110,6 +32637,7 @@ def on_draw():
         pass
     glClearColor(0, 0, 0, 1)
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+    _panel_rects.clear()
 
     glMatrixMode(GL_PROJECTION)
     glLoadIdentity()
@@ -32270,6 +32798,7 @@ def on_draw():
         draw_spheres = []
         draw_bonds = []
         label_infos = []
+        _photon_wave_infos = []  # (screen_x, screen_y, wavelength_nm, frequency_Hz, color_rgb, vel_dir, pos_history) for photon wave overlay
         is_macro = camera.zoom > 50
         for p in particles:
             if p.in_nanotech:
@@ -32304,6 +32833,25 @@ def on_draw():
                         winx, winy, winz = gluProject(*rel_pos, model, proj, view)
                         if winz <= 1.0:
                             label_infos.append((winx, winy, label_text, radius, is_sub))
+            # Collect photon wavelength overlay data (photons are always top-level, never sub-particles)
+            if _show_photon_wavelengths and getattr(p, 'base_type', '') in ('photon', 'gluon'):
+                _pw_rel = p.pos - camera.pos
+                _pw_rel = rotate_vector(_pw_rel, camera.rot)
+                _pw_dist = math.sqrt(_pw_rel[0]*_pw_rel[0] + _pw_rel[1]*_pw_rel[1] + _pw_rel[2]*_pw_rel[2])
+                if _pw_dist < camera.zoom * 500 and _pw_rel[2] <= camera.zoom * 100:
+                    _pw_wx, _pw_wy, _pw_wz = gluProject(*_pw_rel, model, proj, view)
+                    if _pw_wz <= 1.0 and 0 <= _pw_wx <= WIDTH and 0 <= _pw_wy <= HEIGHT:
+                        _pw_obs_wl = getattr(p, 'observed_wavelength', 0)
+                        if _pw_obs_wl > 0:
+                            _pw_nm = _pw_obs_wl * 1e9
+                        else:
+                            _pw_nm = getattr(p, 'rest_wavelength', 550e-9) * 1e9
+                        _pw_freq = c / (max(_pw_obs_wl, 1e-15)) if _pw_obs_wl > 0 else 0
+                        _pw_rgba = wavelength_to_rgb(_pw_nm)
+                        _pw_r, _pw_g, _pw_b = _pw_rgba[0], _pw_rgba[1], _pw_rgba[2]
+                        _pw_n = getattr(p, 'medium_n', 1.0)
+                        _pw_grp_v = getattr(p, 'photon_group_vel', c)
+                        _photon_wave_infos.append((_pw_wx, _pw_wy, _pw_nm, _pw_freq, (_pw_r, _pw_g, _pw_b), _pw_n, _pw_grp_v, p))
             # Skip bonds when bond display is toggled off
             # Also skip bonds for atoms at LOD 0 (too far away)
             if toggle_bond_lines:
@@ -32355,24 +32903,52 @@ def on_draw():
         # Draw 3D spheres with LOD tessellation - opaque first
         # Performance governor: reduce tessellation at low quality
         # Uses display list cache: unit sphere compiled once per LOD, scaled at draw time
+        # OPTIMIZATION: Tiny/distant particles rendered as GL_POINTS in single batch call
         _lod_div = 1 if _perf.quality >= 3 else (2 if _perf.quality >= 1 else 3)
+        _point_threshold = 0.003 if _perf.quality >= 2 else 0.005
+        _point_batch = []  # (x, y, z, r, g, b, point_size) for batch rendering
         for rel_pos, radius, color, dist in opaque_spheres:
-            glPushMatrix()
-            glTranslatef(*rel_pos)
-            _mat_col = (c_float * 4)(color[0] / 255.0, color[1] / 255.0, color[2] / 255.0, color[3] / 255.0)
-            glMaterialfv(GL_FRONT, GL_DIFFUSE, _mat_col)
-            glMaterialfv(GL_FRONT, GL_AMBIENT, _mat_col)
             screen_frac = radius / (dist + 1.0)
-            if screen_frac > 0.05:
-                segs = max(10, 20 // _lod_div)
-            elif screen_frac > 0.01:
-                segs = max(8, 12 // _lod_div)
-            elif screen_frac > 0.002:
-                segs = max(6, 8 // _lod_div)
+            if screen_frac < _point_threshold:
+                # Batch as GL_POINT — skip expensive Push/Translate/Material/Draw/Pop
+                _pt_size = max(1.5, min(screen_frac * 800.0, 6.0))
+                _point_batch.append((rel_pos[0], rel_pos[1], rel_pos[2],
+                                     color[0], color[1], color[2], _pt_size))
             else:
-                segs = 4
-            _draw_cached_sphere(radius, segs)
-            glPopMatrix()
+                glPushMatrix()
+                glTranslatef(*rel_pos)
+                _mat_col = (c_float * 4)(color[0] / 255.0, color[1] / 255.0, color[2] / 255.0, color[3] / 255.0)
+                glMaterialfv(GL_FRONT, GL_DIFFUSE, _mat_col)
+                glMaterialfv(GL_FRONT, GL_AMBIENT, _mat_col)
+                if screen_frac > 0.05:
+                    segs = max(10, 20 // _lod_div)
+                elif screen_frac > 0.01:
+                    segs = max(8, 12 // _lod_div)
+                else:
+                    segs = max(6, 8 // _lod_div)
+                _draw_cached_sphere(radius, segs)
+                glPopMatrix()
+        # Batch-render all distant/tiny particles as GL_POINTS
+        # glPointSize cannot be called inside glBegin/glEnd — group by size bucket
+        if _point_batch:
+            glDisable(GL_LIGHTING)
+            glEnable(GL_POINT_SMOOTH)
+            glHint(GL_POINT_SMOOTH_HINT, GL_NICEST)
+            _pt_buckets = {}
+            for _px, _py, _pz, _pr, _pg, _pb, _psz in _point_batch:
+                _bk = int(_psz * 2) / 2.0  # 0.5px buckets
+                if _bk not in _pt_buckets:
+                    _pt_buckets[_bk] = []
+                _pt_buckets[_bk].append((_px, _py, _pz, _pr, _pg, _pb))
+            for _sz, _pts in _pt_buckets.items():
+                glPointSize(max(1.0, _sz))
+                glBegin(GL_POINTS)
+                for _px, _py, _pz, _pr, _pg, _pb in _pts:
+                    glColor3ub(int(_pr), int(_pg), int(_pb))
+                    glVertex3f(_px, _py, _pz)
+                glEnd()
+            glDisable(GL_POINT_SMOOTH)
+            glEnable(GL_LIGHTING)
 
         # Transparent pass: blended nucleon shells drawn after opaque content
         if transparent_spheres:
@@ -33335,6 +33911,101 @@ def on_draw():
                 _sb_lbl.draw()
                 _sb_lbl.font_size = 9
 
+    # ── Photon Wavelength Visualization Overlay (Shift+W) ──
+    if _show_photon_wavelengths and _photon_wave_infos:
+        _pw_lbl = getattr(on_draw, '_pw_lbl', None)
+        if _pw_lbl is None:
+            _pw_lbl = Label('', font_size=8, anchor_x='left', anchor_y='bottom')
+            on_draw._pw_lbl = _pw_lbl
+        # Wave trail parameters
+        _pw_trail_len = 40  # pixels of sinusoidal trail behind each photon
+        _pw_wave_segs = 20  # segments in the wave trail
+        _pw_time = simulation_time * 8.0  # animation phase
+        for _pwx, _pwy, _pw_nm, _pw_freq, _pw_rgb, _pw_n, _pw_gv, _pw_p in _photon_wave_infos:
+            # Draw sinusoidal wave trail behind the photon
+            _pw_vel = getattr(_pw_p, 'vel', None)
+            if _pw_vel is not None:
+                _vn = math.sqrt(float(_pw_vel[0]*_pw_vel[0] + _pw_vel[1]*_pw_vel[1] + _pw_vel[2]*_pw_vel[2]))
+                if _vn > 1e-10:
+                    # Project velocity direction to screen space for trail direction
+                    _vdir_3d = rotate_vector(_pw_vel / _vn, camera.rot)
+                    # Use x,y components of projected velocity for 2D trail direction
+                    _vdx = float(_vdir_3d[0])
+                    _vdy = float(-_vdir_3d[1])  # screen Y is inverted
+                    _vd_mag = math.sqrt(_vdx*_vdx + _vdy*_vdy)
+                    if _vd_mag > 0.01:
+                        _vdx /= _vd_mag
+                        _vdy /= _vd_mag
+                    else:
+                        _vdx, _vdy = 1.0, 0.0
+                    # Perpendicular direction for wave oscillation
+                    _vpx, _vpy = -_vdy, _vdx
+                    # Wave amplitude scales with wavelength (longer = bigger oscillation)
+                    _pw_amp = min(12.0, max(3.0, _pw_nm / 80.0))
+                    # Oscillation spatial frequency: shorter wavelength = more cycles
+                    _pw_k = max(0.3, min(2.5, 600.0 / max(_pw_nm, 50.0)))
+                    glColor4ub(_pw_rgb[0], _pw_rgb[1], _pw_rgb[2], 180)
+                    glLineWidth(1.5)
+                    glBegin(GL_LINE_STRIP)
+                    for _wi in range(_pw_wave_segs + 1):
+                        _wfrac = _wi / float(_pw_wave_segs)
+                        _wx_off = -_pw_trail_len * _wfrac  # behind the photon
+                        _wy_osc = _pw_amp * math.sin(_pw_k * _wfrac * 2.0 * math.pi + _pw_time)
+                        _fade = 1.0 - _wfrac * 0.7  # fade out toward tail
+                        _sx = _pwx + _wx_off * _vdx + _wy_osc * _vpx
+                        _sy = _pwy + _wx_off * _vdy + _wy_osc * _vpy
+                        glColor4ub(_pw_rgb[0], _pw_rgb[1], _pw_rgb[2], int(180 * _fade))
+                        glVertex2f(_sx, _sy)
+                    glEnd()
+                    glLineWidth(1.0)
+            # Per-photon label: wavelength + frequency + medium info
+            _pw_freq_str = f"{_pw_freq:.2e} Hz" if _pw_freq > 0 else "?"
+            if _pw_nm < 380:
+                _band = "UV"
+            elif _pw_nm < 450:
+                _band = "Violet"
+            elif _pw_nm < 495:
+                _band = "Blue"
+            elif _pw_nm < 570:
+                _band = "Green"
+            elif _pw_nm < 590:
+                _band = "Yellow"
+            elif _pw_nm < 620:
+                _band = "Orange"
+            elif _pw_nm < 750:
+                _band = "Red"
+            elif _pw_nm < 1e6:
+                _band = "IR"
+            elif _pw_nm < 1e9:
+                _band = "μWave"
+            else:
+                _band = "Radio"
+            _pw_info = f"{_pw_nm:.1f}nm ({_band})"
+            if _pw_n > 1.001:
+                _pw_info += f" n={_pw_n:.2f}"
+            _pw_lbl.text = _pw_info
+            _pw_lbl.color = (_pw_rgb[0], _pw_rgb[1], _pw_rgb[2], 220)
+            _pw_lbl.x = int(_pwx) + 6
+            _pw_lbl.y = int(_pwy) + 4
+            _pw_lbl.draw()
+        # HUD legend: small panel showing toggle is active
+        _pw_hud_x = 10
+        _pw_hud_y = 10
+        _pw_hud_w = 210
+        _pw_hud_h = 22
+        glColor4ub(12, 12, 18, 180)
+        glBegin(GL_QUADS)
+        glVertex2f(_pw_hud_x, _pw_hud_y)
+        glVertex2f(_pw_hud_x + _pw_hud_w, _pw_hud_y)
+        glVertex2f(_pw_hud_x + _pw_hud_w, _pw_hud_y + _pw_hud_h)
+        glVertex2f(_pw_hud_x, _pw_hud_y + _pw_hud_h)
+        glEnd()
+        _pw_lbl.text = f"Photon Wavelengths ON  [{len(_photon_wave_infos)} visible]"
+        _pw_lbl.color = (120, 220, 200, 255)
+        _pw_lbl.x = _pw_hud_x + 6
+        _pw_lbl.y = _pw_hud_y + 4
+        _pw_lbl.draw()
+
     # ── Focused Shadow Body 3D Overlay (compact bottom-right display, rotates) ──
     if _shadow_bodies_visible and _shadow_focus_idx >= 0 and _shadow_focus_idx < len(_shadow_bodies):
         _fb = _shadow_bodies[_shadow_focus_idx]
@@ -34251,8 +34922,8 @@ def on_draw():
         menu_title_label.x = WIDTH // 2
         menu_title_label.y = _pt - 25
         menu_title_label.draw()
-        _bw, _bh, _bg = 120, 36, 20
-        _tbw = 3 * _bw + 2 * _bg
+        _bw, _bh, _bg = 120, 36, 15
+        _tbw = 4 * _bw + 3 * _bg
         _bsx = WIDTH // 2 - _tbw // 2
         _by = _pt - 70
         exit_button.x = _bsx
@@ -34534,18 +35205,18 @@ def on_draw():
             _sf_lbl.font_size = max(7, _f1_fs - 1)
             _sf_lbl.draw()
         # Page navigation buttons
-        _f1_btn_y = _f1_py + 8
-        _f1_btn_w = 72
-        _f1_btn_h = 20
+        _f1_btn_y = _f1_py + 10
+        _f1_btn_w = 88
+        _f1_btn_h = 28
         _f1_btn_labels = ['1: Live', '2: How', '3: Ref', '4: Quantum', '5: Audio', '6: Load-Ins', '7: AI Brain', '8: Commands']
         for _pi, _pl in enumerate(_f1_btn_labels):
-            _bx = _f1_px + 10 + _pi * (_f1_btn_w + 4)
-            _bc = (50, 120, 180) if _pi == _f1_page else (40, 44, 55)
+            _bx = _f1_px + 10 + _pi * (_f1_btn_w + 6)
+            _bc = (50, 120, 180) if _pi == _f1_page else (50, 54, 68)
             Rectangle(_bx, _f1_btn_y, _f1_btn_w, _f1_btn_h, color=_bc).draw()
             Label(_pl, x=_bx + _f1_btn_w // 2, y=_f1_btn_y + _f1_btn_h // 2,
-                  font_size=6, color=(255, 255, 255, 255), anchor_x='center', anchor_y='center').draw()
-        Label('F1 close | Scroll to see more', x=WIDTH // 2, y=_f1_py + 4, font_size=9,
-              color=_TH_TEXT_DIM, anchor_x='center').draw()
+                  font_size=9, color=(255, 255, 255, 255), anchor_x='center', anchor_y='center').draw()
+        Label('F1 / ESC to close  |  Keys 1-8 or click tabs to switch pages  |  Left/Right arrows', x=WIDTH // 2, y=_f1_py + 4, font_size=9,
+              color=(200, 200, 220, 255), anchor_x='center').draw()
 
     # F7 â€” Dimensional Sphere Navigation Panel (interactive, polished)
     if show_sphere_nav:
@@ -34553,6 +35224,7 @@ def on_draw():
         _sp_h = 480
         _sp_x = WIDTH // 2 - _sp_w // 2
         _sp_y = (HEIGHT - _UI_BAR_H) // 2 - _sp_h // 2
+        _sp_x, _sp_y, _sp_w, _sp_h = _panel_apply_drag('show_sphere_nav', _sp_x, _sp_y, _sp_w, _sp_h)
         # Panel background with subtle border
         Rectangle(_sp_x - 2, _sp_y - 2, _sp_w + 4, _sp_h + 4, color=(60, 80, 100)).draw()
         Rectangle(_sp_x, _sp_y, _sp_w, _sp_h, color=(16, 20, 30)).draw()
@@ -34835,6 +35507,7 @@ def on_draw():
         _hi_h = 400
         _hi_x = WIDTH // 2 - _hi_w // 2
         _hi_y = (HEIGHT - _UI_BAR_H) // 2 - _hi_h // 2
+        _hi_x, _hi_y, _hi_w, _hi_h = _panel_apply_drag('show_history', _hi_x, _hi_y, _hi_w, _hi_h)
         Rectangle(_hi_x, _hi_y, _hi_w, _hi_h, color=(20, 25, 35)).draw()
         Label('SIMULATION HISTORY', x=WIDTH // 2, y=_hi_y + _hi_h - 16,
               font_size=13, color=_TH_TEXT_ACC, anchor_x='center', anchor_y='center').draw()
@@ -35035,16 +35708,7 @@ def on_draw():
             'Each load-in is tagged [AI] or [USER] to track origin.',
             'AI observers can activate load-ins via toggle_loadin action.',
         ]
-        _p2_lbl = getattr(on_draw, '_p2_lbl', None)
-        if _p2_lbl is None:
-            _p2_lbl = Label('', font_size=9, color=_TH_TEXT, multiline=True,
-                            width=_f1_pw - 40, anchor_x='left', anchor_y='top')
-            on_draw._p2_lbl = _p2_lbl
-        _p2_lbl.text = chr(10).join(_p2_lines)
-        _p2_lbl.x = _f1_px + 20
-        _p2_lbl.y = _f1_py + _f1_ph - 40
-        _p2_lbl.width = _f1_pw - 40
-        _p2_lbl.draw()
+        _f1_draw_columns(_p2_lines, 3, '_p2_cols', _f1_px, _f1_py, _f1_pw, _f1_ph)
 
     if show_info_overlay and _f1_page == 2:
         _f1_px = int(WIDTH * 0.01)
@@ -35072,7 +35736,7 @@ def on_draw():
             '7=Grav Potential  8=Kinetic Field  9=Run Odds',
             '0=Mandelbrot Grid  .=Mandelbrot Map  -=AI Dashboard',
             ',=Shadow Bodies  \'=Shadow Outline  \\=Focus Shadow Body',
-            '==AFK Auto-Unpause  Shift+==Cycle AFK Duration',
+            '==AFK Auto-Unpause  Shift+==Cycle AFK Duration  Shift+W=Photon Wavelengths',
             '',
             '--- AI OBSERVER CONTROLS ---',
             'TAB=Toggle AI Spawn Permission (default OFF)',
@@ -35138,16 +35802,7 @@ def on_draw():
             'Link colors encode trace of gauge matrices (Re(Tr(U))/Nc).',
             'Tiled periodically across visible space.',
         ]
-        _p3_lbl = getattr(on_draw, '_p3_lbl', None)
-        if _p3_lbl is None:
-            _p3_lbl = Label('', font_size=9, color=_TH_TEXT, multiline=True,
-                            width=_f1_pw - 40, anchor_x='left', anchor_y='top')
-            on_draw._p3_lbl = _p3_lbl
-        _p3_lbl.text = chr(10).join(_p3_lines)
-        _p3_lbl.x = _f1_px + 20
-        _p3_lbl.y = _f1_py + _f1_ph - 40
-        _p3_lbl.width = _f1_pw - 40
-        _p3_lbl.draw()
+        _f1_draw_columns(_p3_lines, 3, '_p3_cols', _f1_px, _f1_py, _f1_pw, _f1_ph)
 
     # Page 4: Quantum & Wave Physics (live data)
     if show_info_overlay and _f1_page == 3:
@@ -35226,18 +35881,9 @@ def on_draw():
         _p4_lines.append(f'h  = {h:.6e} J*s  (Planck constant)')
         _p4_lines.append(f'c  = {c:.6e} m/s  (speed of light)')
         _p4_lines.append(f'k_B = {k_B:.6e} J/K  (Boltzmann)')
-        _p4_lines.append(f'e  = {e_charge:.6e} C  (elementary charge)')
+        _p4_lines.append(f'e  = {e:.6e} C  (elementary charge)')
         _p4_lines.append(f'm_e = {m_e:.6e} kg  (electron mass)')
-        _p4_lbl = getattr(on_draw, '_p4_lbl', None)
-        if _p4_lbl is None:
-            _p4_lbl = Label('', font_size=9, color=_TH_TEXT, multiline=True,
-                            width=_f1_pw - 40, anchor_x='left', anchor_y='top')
-            on_draw._p4_lbl = _p4_lbl
-        _p4_lbl.text = chr(10).join(_p4_lines)
-        _p4_lbl.x = _f1_px + 20
-        _p4_lbl.y = _f1_py + _f1_ph - 40
-        _p4_lbl.width = _f1_pw - 40
-        _p4_lbl.draw()
+        _f1_draw_columns(_p4_lines, 3, '_p4_cols', _f1_px, _f1_py, _f1_pw, _f1_ph)
 
     # Page 5: Audio Sonification System (live channel status)
     if show_info_overlay and _f1_page == 4:
@@ -35287,16 +35933,7 @@ def on_draw():
         _p5_lines.append('  Geiger counter click synthesis on decay events')
         _p5_lines.append('  Sharp attack (1ms), exponential release (50ms)')
         _p5_lines.append('  Random timing from stochastic decay process')
-        _p5_lbl = getattr(on_draw, '_p5_lbl', None)
-        if _p5_lbl is None:
-            _p5_lbl = Label('', font_size=9, color=_TH_TEXT, multiline=True,
-                            width=_f1_pw - 40, anchor_x='left', anchor_y='top')
-            on_draw._p5_lbl = _p5_lbl
-        _p5_lbl.text = chr(10).join(_p5_lines)
-        _p5_lbl.x = _f1_px + 20
-        _p5_lbl.y = _f1_py + _f1_ph - 40
-        _p5_lbl.width = _f1_pw - 40
-        _p5_lbl.draw()
+        _f1_draw_columns(_p5_lines, 3, '_p5_cols', _f1_px, _f1_py, _f1_pw, _f1_ph)
 
     # Page 6: AI Load-Ins & Effects (live status + log)
     if show_info_overlay and _f1_page == 5:
@@ -35347,16 +35984,7 @@ def on_draw():
         _p6_lines.append('visual: rendered overlays (glow, trails, fields, fringes)')
         _p6_lines.append('audio:  sonification channels (physics-based 44.1kHz)')
         _p6_lines.append('info:   per-particle data labels and readouts')
-        _p6_lbl = getattr(on_draw, '_p6_lbl', None)
-        if _p6_lbl is None:
-            _p6_lbl = Label('', font_size=9, color=_TH_TEXT, multiline=True,
-                            width=_f1_pw - 40, anchor_x='left', anchor_y='top')
-            on_draw._p6_lbl = _p6_lbl
-        _p6_lbl.text = chr(10).join(_p6_lines)
-        _p6_lbl.x = _f1_px + 20
-        _p6_lbl.y = _f1_py + _f1_ph - 40
-        _p6_lbl.width = _f1_pw - 40
-        _p6_lbl.draw()
+        _f1_draw_columns(_p6_lines, 3, '_p6_cols', _f1_px, _f1_py, _f1_pw, _f1_ph)
 
     # Page 7: AI Consciousness System (SubconsciousEngine + Observer architecture)
     if show_info_overlay and _f1_page == 6:
@@ -35467,16 +36095,7 @@ def on_draw():
                     _p7_lines.append(f'  {_ob.name}: SubconsciousEngine not loaded')
         else:
             _p7_lines.append('  (observers not loaded)')
-        _p7_lbl = getattr(on_draw, '_p7_lbl', None)
-        if _p7_lbl is None:
-            _p7_lbl = Label('', font_size=9, color=_TH_TEXT, multiline=True,
-                            width=_f1_pw - 40, anchor_x='left', anchor_y='top')
-            on_draw._p7_lbl = _p7_lbl
-        _p7_lbl.text = chr(10).join(_p7_lines)
-        _p7_lbl.x = _f1_px + 20
-        _p7_lbl.y = _f1_py + _f1_ph - 40
-        _p7_lbl.width = _f1_pw - 40
-        _p7_lbl.draw()
+        _f1_draw_columns(_p7_lines, 3, '_p7_cols', _f1_px, _f1_py, _f1_pw, _f1_ph)
 
     # Page 8: All Commands (dynamic list from _HOTKEY_ACTIONS + extras)
     if show_info_overlay and _f1_page == 7:
@@ -35539,34 +36158,25 @@ def on_draw():
         _p8_lines.append('  F12          Molecules Panel')
         _p8_lines.append('  4            Nanotech Focus List')
         _p8_lines.append('  5            Molecule Focus List')
-        _p8_lbl = getattr(on_draw, '_p8_lbl', None)
-        if _p8_lbl is None:
-            _p8_lbl = Label('', font_size=9, color=_TH_TEXT, multiline=True,
-                            width=_f1_pw - 40, anchor_x='left', anchor_y='top')
-            on_draw._p8_lbl = _p8_lbl
-        _p8_lbl.text = chr(10).join(_p8_lines)
-        _p8_lbl.x = _f1_px + 20
-        _p8_lbl.y = _f1_py + _f1_ph - 40
-        _p8_lbl.width = _f1_pw - 40
-        _p8_lbl.draw()
+        _f1_draw_columns(_p8_lines, 3, '_p8_cols', _f1_px, _f1_py, _f1_pw, _f1_ph)
 
-    # Page buttons for pages 1-7
-    if show_info_overlay and _f1_page in (1, 2, 3, 4, 5, 6, 7):
+    # Page buttons for all F1 pages (0-7)
+    if show_info_overlay:
         _f1_px = int(WIDTH * 0.01)
         _f1_py = int(HEIGHT * 0.02)
         _f1_pw = int(WIDTH * 0.98)
-        _f1_btn_y = _f1_py + 8
-        _f1_btn_w = 72
-        _f1_btn_h = 20
+        _f1_btn_y = _f1_py + 10
+        _f1_btn_w = 88
+        _f1_btn_h = 28
         _f1_btn_labels = ['1: Live', '2: How', '3: Ref', '4: Quantum', '5: Audio', '6: Load-Ins', '7: AI Brain', '8: Commands']
         for _pi, _pl in enumerate(_f1_btn_labels):
-            _bx = _f1_px + 10 + _pi * (_f1_btn_w + 4)
-            _bc = (50, 120, 180) if _pi == _f1_page else (40, 44, 55)
+            _bx = _f1_px + 10 + _pi * (_f1_btn_w + 6)
+            _bc = (50, 120, 180) if _pi == _f1_page else (50, 54, 68)
             Rectangle(_bx, _f1_btn_y, _f1_btn_w, _f1_btn_h, color=_bc).draw()
             Label(_pl, x=_bx + _f1_btn_w // 2, y=_f1_btn_y + _f1_btn_h // 2,
-                  font_size=6, color=(255, 255, 255, 255), anchor_x='center', anchor_y='center').draw()
-        Label('Press F1 to close  |  Click page buttons below', x=_f1_px + _f1_pw // 2,
-              y=_f1_py + _f1_btn_y + _f1_btn_h + 4, font_size=7, color=_TH_TEXT_DIM, anchor_x='center').draw()
+                  font_size=9, color=(255, 255, 255, 255), anchor_x='center', anchor_y='center').draw()
+        Label('F1 / ESC to close  |  Keys 1-8 or click tabs to switch pages  |  Left/Right arrows', x=_f1_px + _f1_pw // 2,
+              y=_f1_btn_y + _f1_btn_h + 6, font_size=9, color=(200, 200, 220, 255), anchor_x='center').draw()
 
     # ; key - Observer Consciousness Panel
     if show_observer_panel and _observer_mgr and _OBSERVER_AVAILABLE:
@@ -35574,6 +36184,7 @@ def on_draw():
         _op_h = min(HEIGHT - _UI_BAR_H - 20, 800)
         _op_x = 10
         _op_y = HEIGHT - _UI_BAR_H - _op_h - 10
+        _op_x, _op_y, _op_w, _op_h = _panel_apply_drag('show_observer_panel', _op_x, _op_y, _op_w, _op_h)
         Rectangle(_op_x, _op_y, _op_w, _op_h, color=(16, 20, 30)).draw()
         Label('AI OBSERVER CONSCIOUSNESS', x=_op_x + _op_w // 2, y=_op_y + _op_h - 16,
               font_size=13, color=_TH_TEXT_ACC, anchor_x='center', anchor_y='center').draw()
@@ -35627,6 +36238,7 @@ def on_draw():
         _ai_h = min(HEIGHT - _UI_BAR_H - 16, 860)
         _ai_x = WIDTH - _ai_w - 8
         _ai_y = HEIGHT - _UI_BAR_H - _ai_h - 8
+        _ai_x, _ai_y, _ai_w, _ai_h = _panel_apply_drag('show_ai_dashboard', _ai_x, _ai_y, _ai_w, _ai_h)
         Rectangle(_ai_x, _ai_y, _ai_w, _ai_h, color=(14, 18, 28)).draw()
         # Border
         glColor4ub(50, 80, 120, 180)

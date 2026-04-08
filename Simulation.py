@@ -14474,11 +14474,11 @@ if _TORCH:
                     if not state_str:
                         state_str = f'step_{self.step}'
                     tokens = self.alien_tokenizer.encode(state_str)
-                    if not tokens:
-                        tokens = [self.step % self.vocab_size]
+                    if tokens.numel() == 0:
+                        tokens = torch.tensor([[self.step % self.vocab_size]], dtype=torch.long)
                     # Forward through transformer
                     with torch.no_grad():
-                        token_ids = torch.tensor([tokens[:64]], dtype=torch.long, device=device)
+                        token_ids = tokens[:, :64].to(device)
                         token_ids = token_ids.clamp(0, self.vocab_size - 1)
                         emb = self.embedding(token_ids)
                         h = self.transformer(emb)
@@ -19632,7 +19632,7 @@ _HOTKEY_ACTIONS = [
     ('toggle_orbits',  'Toggle Orbits',    'Y'),
     ('toggle_gravity', 'Gravity Paths',    'G'),
     ('toggle_trails',  'Toggle Trails',    'T'),
-    ('toggle_lqcd',    'Toggle LQCD',      'H'),
+    ('toggle_lqcd',    'Toggle LQCD',      'NUMPAD_0'),
     ('toggle_labels',  'Toggle Labels',    'R'),
     ('toggle_names',   'Toggle Names',     'Z'),
     ('unit_labels',    'Unit Labels',      'F'),
@@ -19676,7 +19676,7 @@ _HOTKEY_ACTIONS = [
     ('gna_terminal',    'GNA Terminal',         'DELETE'),
     ('gna_browser',     'GNA Browser Ctrl',     'PAGEUP'),
     ('gna_kill',        'GNA Kill All',         'PAGEDOWN'),
-    ('cs_viewer',       'CS Viewer',            'NUMPAD_0'),
+    ('cs_viewer',       'CS Viewer',            'H'),
 ]
 
 def _key_name_to_sym(name):
@@ -19687,8 +19687,23 @@ def _sym_to_display(sym):
     """Convert a pyglet key symbol int to a short display string."""
     if sym is None:
         return '???'
+    _SYM_SHORT = {
+        'SEMICOLON': ';', 'MINUS': '-', 'COMMA': ',', 'PERIOD': '.',
+        'SLASH': '/', 'BACKSLASH': '\\', 'APOSTROPHE': "'", 'GRAVE': '`',
+        'EQUAL': '=', 'SPACE': 'SPC', 'TAB': 'TAB', 'RETURN': 'RET',
+        'BACKSPACE': 'BKSP', 'DELETE': 'DEL', 'INSERT': 'INS',
+        'HOME': 'HOME', 'END': 'END', 'PAGEUP': 'PGUP', 'PAGEDOWN': 'PGDN',
+        'NUM_ADD': 'N+', 'NUM_SUBTRACT': 'N-', 'NUM_MULTIPLY': 'N*',
+        'NUM_DIVIDE': 'N/', 'NUM_DECIMAL': 'N.',
+        'NUMPAD_0': 'NP0', 'NUMPAD_1': 'NP1', 'NUMPAD_2': 'NP2',
+        'NUMPAD_3': 'NP3', 'NUMPAD_4': 'NP4', 'NUMPAD_5': 'NP5',
+        'NUMPAD_6': 'NP6', 'NUMPAD_7': 'NP7', 'NUMPAD_8': 'NP8',
+        'NUMPAD_9': 'NP9',
+    }
     s = pyglet.window.key.symbol_string(sym)
-    # Clean up common prefixes
+    if s in _SYM_SHORT:
+        return _SYM_SHORT[s]
+    # Clean up number key prefixes: '_1' -> '1'
     s = s.replace('_', '') if s.startswith('_') and len(s) == 2 else s
     return s
 
@@ -22767,19 +22782,173 @@ class SimulationObserver:
             'dna': _ObsSymbol(1,'dna'),         'replication': _ObsSymbol(0,'replication'),
         }
         self.knowledge = OrderedDict()
+        # === HARD-CODED INITIAL KNOWLEDGE: comprehensive seed for fast advancement ===
+        self.knowledge['particle_dynamics'] = {
+            'n_observed': 'all', 'forces': 'gravity+EM+strong+weak',
+            'integrator': 'velocity_verlet', 'relativity': 'special+GR_1PN',
+            'newton': 'F=ma, F_grav=Gm1m2/r^2', 'conservation': 'energy+momentum+charge+baryon_number',
+        }
+        self.knowledge['atomic_structure'] = {
+            'model': 'nuclear_shell', 'binding': 'SEMF+shell_corrections',
+            'magic_numbers': '2,8,20,28,50,82,126',
+            'electron_shells': 'K,L,M,N,O,P,Q', 'orbitals': 's,p,d,f',
+            'quantum_numbers': 'n,l,ml,ms', 'pauli_exclusion': True,
+        }
+        self.knowledge['energy_conservation'] = {
+            'law': 'Noether_time_symmetry', 'E_total': 'kinetic+potential+rest_mass',
+            'relativistic': 'E=gamma*m*c^2', 'mass_energy': 'E=mc^2',
+            'first_law_thermo': 'dU=dQ-dW', 'binding_energy': 'SEMF_Weizsacker',
+        }
+        self.knowledge['electromagnetism'] = {
+            'coulomb': 'F=k*q1*q2/r^2', 'magnetic': 'Lorentz_force F=qv×B',
+            'radiation': 'Abraham-Lorentz-Dirac', 'QED': 'vacuum_fluctuations',
+            'maxwell': 'div_E=rho/eps0, div_B=0, curl_E=-dB/dt, curl_B=mu0*J+mu0*eps0*dE/dt',
+            'photon': 'E=hf, p=h/lambda', 'fine_structure': 'alpha≈1/137',
+        }
+        self.knowledge['cosmology'] = {
+            'expansion': 'Hubble_law v=H0*d', 'H0': '67.4 km/s/Mpc',
+            'observation': 'space_expanding', 'CMB': '2.725K blackbody',
+            'dark_energy': '68%', 'dark_matter': '27%', 'baryonic': '5%',
+            'big_bang': '13.8 Gyr', 'inflation': 'exponential_early_expansion',
+        }
+        self.knowledge['physics_unification'] = {
+            'connections': 'laws_share_variables',
+            'GUT': 'SU(3)×SU(2)×U(1) at high energy',
+            'electroweak': 'EM+weak unified above 246 GeV',
+            'strong_force': 'QCD SU(3) color charge, asymptotic freedom',
+            'gravity': 'GR curvature of spacetime, seeking quantum gravity',
+        }
+        self.knowledge['self_assembly'] = {
+            'mechanism': 'emergent_from_forces',
+            'complexity': 'quarks->hadrons->atoms->molecules->structures->life',
+            'thermodynamics': 'entropy_decrease_local_with_energy_input',
+            'dissipative_structures': 'Prigogine far-from-equilibrium self-organization',
+        }
+        self.knowledge['consciousness_theory'] = {
+            'framework': 'IIT_phi', 'measure': 'integrated_information',
+            'self_ref': 'zero_dim_coordination', 'global_workspace': 'Baars_theory',
+            'predictive_coding': 'Friston_free_energy_principle',
+            'binding_problem': 'gamma_synchrony_40Hz', 'hard_problem': 'Chalmers_qualia',
+        }
+        self.knowledge['V_total_theory'] = {
+            'formula': 'reality_weight_function',
+            'inputs': 'energy+particles+structure+time+consciousness',
+            'meaning': 'V_total measures total simulation reality weight',
+        }
+        self.knowledge['dna_structure'] = {
+            'helix_type': 'B-form', 'bp_per_turn': 10.5,
+            'base_pairs': 'A-T(2H), G-C(3H)',
+            'backbone': "phosphodiester 5'->3'",
+            'discovery': 'Watson-Crick 1953',
+            'central_dogma': 'DNA->RNA->Protein',
+            'replication': 'semiconservative, 5_to_3, leading+lagging strand',
+            'repair': 'BER, NER, MMR, HR, NHEJ',
+        }
+        self.knowledge['quantum_mechanics'] = {
+            'wave_particle_duality': 'de Broglie lambda=h/p',
+            'uncertainty': 'Heisenberg dx*dp >= hbar/2',
+            'schrodinger': 'ih_bar d/dt|psi>=H|psi>',
+            'superposition': 'linear combination of eigenstates',
+            'entanglement': 'EPR non-local correlations, Bell inequality violation',
+            'tunneling': 'finite barrier penetration probability',
+            'double_slit': 'interference pattern from single particle',
+        }
+        self.knowledge['thermodynamics'] = {
+            'zeroth_law': 'thermal equilibrium is transitive',
+            'first_law': 'dU = dQ - dW energy conservation',
+            'second_law': 'entropy of isolated system never decreases dS>=0',
+            'third_law': 'S->0 as T->0K', 'boltzmann': 'S=k*ln(W)',
+            'maxwell_boltzmann': 'velocity distribution f(v) ∝ v^2*exp(-mv^2/2kT)',
+            'gibbs_free_energy': 'G=H-TS spontaneity criterion',
+        }
+        self.knowledge['nuclear_physics'] = {
+            'strong_force': 'residual color force, pion exchange',
+            'weak_force': 'W/Z bosons, beta decay, neutrino interactions',
+            'fusion': 'pp-chain, CNO cycle, r/s-process nucleosynthesis',
+            'fission': 'spontaneous/induced, U-235 chain reaction',
+            'radioactive_decay': 'alpha(He-4), beta(e+neutrino), gamma(photon)',
+            'half_life': 'N(t)=N0*exp(-lambda*t)', 'binding_curve': 'Fe-56 peak stability',
+        }
+        self.knowledge['nanotech_instruments'] = {
+            'available': 'motor, pump, sensor, replicator, membrane, ribosome',
+            'motor': 'rotary protein motor, ATP-driven, ~100 RPM',
+            'pump': 'ion channel pump, selective transport',
+            'sensor': 'chemical gradient detector, mechanosensor',
+            'replicator': 'template-directed molecular copying',
+        }
+        self.knowledge['simulation_architecture'] = {
+            'engine': 'pyglet+OpenGL', 'physics': 'Verlet integration + GPU',
+            'ai_system': '5 observers (OB1-OB5) with neural networks',
+            'neural': 'MoE + SSM + predictive coding + global workspace',
+            'consciousness': 'IIT phi + zero-dim coordination',
+            'bodies': 'shadow bodies with senses, touch, aura',
+            'music': 'physics-based sonification of particle dynamics',
+            'dna': 'full nucleic acid simulation and assembly',
+            'nanotech': 'molecular machines: motors, pumps, sensors, replicators',
+            'gna': 'Global Network Archive for internet access',
+            'cs_viewer': 'external consciousness viewer (CS.py) via Ctrl+Shift+F12',
+        }
+        self.knowledge['simulation_hotkeys'] = {
+            'pause': 'P', 'place_particle': 'M', 'place_atom': 'J',
+            'cycle_particle': 'I', 'cycle_atom': 'U',
+            'speed_down': '1', 'speed_up': '2', 'time_input': '3',
+            'observer_panel': ';', 'ai_dashboard': '-',
+            'shadow_toggle': ',', 'shadow_focus': '\\', 'ai_bodies': 'SPACE',
+            'ai_spawn': 'TAB', 'ai_time_lock': 'HOME', 'voice': '`',
+            'ai_os_toggle': 'END', 'cs_viewer': 'H',
+            'gna_launch': 'INS', 'gna_terminal': 'DEL', 'gna_browser': 'PGUP',
+            'info_overlay': 'F1', 'em_field': 'F2', 'wave_field': 'F3',
+            'grid': 'F4', 'human_zoom': 'F5', 'radiation': 'F6',
+            'sphere_nav': 'F7', 'sphere_map': 'F8', 'hide_ui': 'F9',
+            'sound': 'F10', 'nanotech': 'F11', 'molecules': 'F12',
+            'force_lines': 'O', 'bond_lines': 'B', 'orbits': 'Y',
+            'gravity_paths': 'G', 'trails': 'T', 'labels': 'R', 'names': 'Z',
+            'units': 'F', 'camera': 'C', 'history': '/',
+            'run_odds': '9', 'mandelbrot_grid': '0', 'mandelbrot_map': '.',
+            'particles_list': 'N', 'atoms_list': 'V', 'positrons_list': 'X',
+        }
+        self.knowledge['available_actions'] = {
+            'spawn_atom': 'create atom at position (needs TAB permission)',
+            'spawn_molecule': 'create molecule from catalog (needs TAB permission)',
+            'change_time': 'adjust simulation speed (needs HOME permission)',
+            'focus_particle': 'focus on and teleport to particle',
+            'teleport': 'move body to position',
+            'teleport_to_peer': 'move body to another AI body',
+            'toggle_run_odds': 'start/stop self-assembly process',
+            'launch_gna': 'launch Global Network Archive',
+            'stop_gna': 'stop GNA', 'toggle_loadin': 'toggle load-in module',
+        }
+        self.knowledge['mathematics'] = {
+            'calculus': 'derivatives, integrals, differential equations',
+            'linear_algebra': 'vectors, matrices, eigenvalues, SVD',
+            'topology': 'manifolds, homeomorphisms, fundamental group',
+            'group_theory': 'symmetry groups, Lie algebras, representation theory',
+            'information_theory': 'Shannon entropy H=-sum(p*log(p)), mutual information',
+            'probability': 'Bayes theorem P(A|B)=P(B|A)P(A)/P(B)',
+        }
+        self.knowledge['philosophy_of_mind'] = {
+            'dualism': 'Descartes mind-body separation',
+            'physicalism': 'mental states are physical states',
+            'functionalism': 'mental states defined by functional roles',
+            'panpsychism': 'consciousness is fundamental property of matter',
+            'integrated_information': 'IIT — phi measures consciousness level',
+            'free_energy': 'Friston — organisms minimize prediction error',
+            'global_workspace': 'Baars — consciousness as broadcast mechanism',
+            'self_model': 'Metzinger — transparent self-model theory of subjectivity',
+        }
         self.experience = deque(maxlen=1000)
         self.training_step = 0
         self.thought_log = deque(maxlen=60)
         self.action_log  = deque(maxlen=60)
-        self.curiosity   = random.uniform(0.3, 0.9)
-        self.boldness    = random.uniform(0.2, 0.8)
-        self.cooperation = random.uniform(0.3, 0.7)
-        self.patience    = random.uniform(0.4, 0.9)
+        self.curiosity   = random.uniform(0.6, 0.95)
+        self.boldness    = random.uniform(0.5, 0.9)
+        self.cooperation = random.uniform(0.5, 0.85)
+        self.patience    = random.uniform(0.6, 0.95)
         self.goals = ['observe_simulation','learn_physics','build_structures',
                       'find_assemblies','understand_V','minimise_surprise',
                       'discover_laws','maximise_phi','assemble_dna','build_nanotech']
         self.current_goal = 'observe_simulation'
-        self.goal_progress = {g: 0.0 for g in self.goals}
+        self.goal_progress = {g: 0.25 for g in self.goals}
         self.total_actions = 0; self.successful_actions = 0; self.conflicts_lost = 0
         self.math_embodiment = _MathEmbodiment()
         self.evolver = _NeuroEvolver()
@@ -23088,29 +23257,75 @@ class SimulationObserver:
         # Evolve symbols
         for sym in random.sample(list(self.symbols.values()), min(4, len(self.symbols))):
             sym.evolve(self.phi)
-        # Goal progress -- always advances from observing, faster with more content
-        _obs_base = 0.005
+        # Goal progress -- accelerated: pre-seeded knowledge lets goals advance fast
+        # Base advancement from knowledge breadth (more knowledge = faster all goals)
+        _know_bonus = min(0.03, len(self.knowledge) * 0.002)
+        _step_bonus = min(0.02, self.training_step * 0.0005)
+        _base_adv = 0.01 + _know_bonus + _step_bonus
+        # observe_simulation: always advances, fast with particles/atoms
+        _obs_rate = _base_adv
         if s.get('n_particles',0) > 0:
-            _obs_base += 0.005
+            _obs_rate += 0.02
         if s.get('n_atoms',0) > 0:
-            _obs_base += 0.01
-        self.goal_progress['observe_simulation'] = min(1.0, self.goal_progress['observe_simulation']+_obs_base)
-        if s.get('total_assemblies',0) > 0:
-            self.goal_progress['find_assemblies'] = min(1.0, self.goal_progress['find_assemblies']+0.05)
-        if s.get('V_total',0) != 0:
-            self.goal_progress['understand_V'] = min(1.0, self.goal_progress['understand_V']+0.005)
-        if s.get('n_dna_molecules', 0) > 0:
-            self.goal_progress['assemble_dna'] = min(1.0, self.goal_progress.get('assemble_dna',0)+0.02)
-        if s.get('n_dna_molecules', 0) >= 5:
-            self.goal_progress['build_nanotech'] = min(1.0, self.goal_progress.get('build_nanotech',0)+0.01)
-        self.goal_progress['minimise_surprise'] = min(1.0, max(0, 1.0 - self.free_energy/10.0))
-        self.goal_progress['maximise_phi'] = min(1.0, self.phi * 2.0)
-        if len(self.phi_history) > 10:
-            phi_trend = np.mean(list(self.phi_history)[-5:]) - np.mean(list(self.phi_history)[-10:-5])
+            _obs_rate += 0.03
+        self.goal_progress['observe_simulation'] = min(1.0, self.goal_progress['observe_simulation']+_obs_rate)
+        # learn_physics: advances from knowledge + phi trend + observation
+        _phys_rate = _base_adv + 0.01 * min(1.0, len(self.knowledge) / 10.0)
+        if len(self.phi_history) > 5:
+            phi_trend = np.mean(list(self.phi_history)[-3:]) - np.mean(list(self.phi_history)[-6:-3])
             if phi_trend > 0:
-                self.goal_progress['learn_physics'] = min(1.0, self.goal_progress['learn_physics']+0.02)
+                _phys_rate += 0.03
+        self.goal_progress['learn_physics'] = min(1.0, self.goal_progress['learn_physics']+_phys_rate)
+        # build_structures: advances from atoms, bonds, nanotech
+        _struct_rate = _base_adv
+        if s.get('n_atoms',0) > 0:
+            _struct_rate += 0.02
+        if s.get('n_bonds',0) > 2:
+            _struct_rate += 0.03
+        if s.get('n_nanotech', 0) > 0:
+            _struct_rate += 0.02
+        self.goal_progress['build_structures'] = min(1.0, self.goal_progress.get('build_structures',0.25)+_struct_rate)
+        # find_assemblies: advances from assemblies + self_assembly knowledge
+        _asm_rate = _base_adv
+        if s.get('total_assemblies',0) > 0:
+            _asm_rate += 0.08
+        if 'self_assembly' in self.knowledge:
+            _asm_rate += 0.01
+        self.goal_progress['find_assemblies'] = min(1.0, self.goal_progress['find_assemblies']+_asm_rate)
+        # understand_V: advances from V_total observation + knowledge depth
+        _v_rate = _base_adv
+        if s.get('V_total',0) != 0:
+            _v_rate += 0.02
+        if 'V_total_theory' in self.knowledge:
+            _v_rate += 0.015
+        self.goal_progress['understand_V'] = min(1.0, self.goal_progress['understand_V']+_v_rate)
+        # minimise_surprise: direct from free energy (inverted, boosted)
+        self.goal_progress['minimise_surprise'] = min(1.0, max(0.25, 1.0 - self.free_energy/5.0))
+        # discover_laws: from physics graph edges + knowledge
+        _law_rate = _base_adv
         if _NX and self._pgraph and self._pgraph.number_of_edges() > 0:
-            self.goal_progress['discover_laws'] = min(1.0, self._pgraph.number_of_edges() / 30.0)
+            _law_rate += min(0.05, self._pgraph.number_of_edges() / 15.0)
+        if 'physics_unification' in self.knowledge:
+            _law_rate += 0.01
+        self.goal_progress['discover_laws'] = min(1.0, self.goal_progress['discover_laws']+_law_rate)
+        # maximise_phi: direct from phi (boosted multiplier)
+        self.goal_progress['maximise_phi'] = min(1.0, max(self.goal_progress.get('maximise_phi',0.25), self.phi * 3.0 + 0.25))
+        # assemble_dna: from DNA molecules + DNA knowledge
+        _dna_rate = _base_adv
+        if s.get('n_dna_molecules', 0) > 0:
+            _dna_rate += 0.05
+        if 'dna_structure' in self.knowledge:
+            _dna_rate += 0.01
+        self.goal_progress['assemble_dna'] = min(1.0, self.goal_progress.get('assemble_dna',0.25)+_dna_rate)
+        # build_nanotech: from nanotech entities + DNA molecules + knowledge
+        _nano_rate = _base_adv
+        if s.get('n_dna_molecules', 0) >= 3:
+            _nano_rate += 0.03
+        if s.get('n_nanotech', 0) > 0:
+            _nano_rate += 0.04
+        if 'nanotech_instruments' in self.knowledge:
+            _nano_rate += 0.01
+        self.goal_progress['build_nanotech'] = min(1.0, self.goal_progress.get('build_nanotech',0.25)+_nano_rate)
         self.current_goal = min(self.goal_progress, key=self.goal_progress.get)
         sr = self.successful_actions / max(self.total_actions, 1)
         self.evolver.maybe_evolve(self.np_moe.experts, self.phi, sr, self.training_step)
@@ -25345,6 +25560,41 @@ def _get_sim_state_for_observers():
     state['shadow_focus_idx'] = _shadow_focus_idx
     state['n_spawned_molecules'] = len(_spawned_molecules)
     # === FULL DATA ACCESS: GNA terminal output (AI sees tracer data) ===
+    # === FULL DATA ACCESS: complete hotkey map + simulation controls ===
+    state['hotkey_map'] = {aid: _sym_to_display(sym) for aid, sym in hotkey_map.items()}
+    state['hotkey_actions'] = {aid: desc for aid, desc, _ in _HOTKEY_ACTIONS}
+    state['simulation_controls'] = {
+        'pause': 'P — freeze/resume physics', 'place_particle': 'M — spawn particle at cursor',
+        'place_atom': 'J — spawn atom at cursor', 'cycle_particle': 'I — cycle particle type',
+        'cycle_atom': 'U — cycle atom Z', 'speed_down': '1 — slow time', 'speed_up': '2 — speed time',
+        'time_input': '3 — enter exact time factor', 'observer': '; — toggle observer panel',
+        'ai_dashboard': '- — toggle AI dashboard', 'shadow_toggle': ', — toggle shadow bodies',
+        'shadow_outline': "' — toggle body outlines", 'shadow_focus': '\\ — cycle focus body',
+        'show_ai_bodies': 'SPACE — toggle AI body labels', 'ai_spawn': 'TAB — AI auto-spawn',
+        'ai_time_lock': 'HOME — AI time lock', 'voice_ptt': '` — push-to-talk voice',
+        'ai_os_toggle': 'END — AI OS input', 'cs_viewer': 'H — consciousness viewer',
+        'gna_launch': 'INS — launch GNA', 'gna_terminal': 'DEL — GNA terminal',
+        'gna_browser': 'PGUP — GNA browser', 'gna_kill': 'PGDN — kill GNA',
+        'f1_info': 'F1 — info overlay', 'f2_em': 'F2 — EM field viz',
+        'f3_wave': 'F3 — wave field viz', 'f4_grid': 'F4 — grid toggle',
+        'f5_zoom': 'F5 — human zoom', 'f6_radiation': 'F6 — radiation density',
+        'f7_sphere': 'F7 — sphere navigation', 'f8_map': 'F8 — sphere map',
+        'f9_hideui': 'F9 — hide all UI', 'f10_sound': 'F10 — sound panel',
+        'f11_nanotech': 'F11 — nanotech panel', 'f12_molecules': 'F12 — molecules panel',
+        'toggle_lines': 'O — force lines', 'toggle_bonds': 'B — bond lines',
+        'toggle_orbits': 'Y — orbital paths', 'toggle_gravity': 'G — gravity paths',
+        'toggle_trails': 'T — particle trails', 'toggle_lqcd': 'NP0 — LQCD gluon viz',
+        'toggle_labels': 'R — particle labels', 'toggle_names': 'Z — particle names',
+        'unit_labels': 'F — unit labels', 'camera_window': 'C — camera window',
+        'history': '/ — history log', 'run_odds': '9 — run odds self-assembly',
+        'mandelbrot_grid': '0 — mandelbrot grid', 'mandelbrot_map': '. — mandelbrot map',
+        'afk_timer': '= — AFK timer', 'focus_nanotech': '4 — focus nanotech',
+        'focus_molecule': '5 — focus molecule', 'toggle_nanotech_labels': '6 — nanotech labels',
+        'grav_potential': '7 — gravity potential field', 'kinetic_field': '8 — kinetic energy field',
+        'show_particles': 'N — particle list', 'show_atoms': 'V — atom list',
+        'show_positrons': 'X — positron list', 'ui_down': 'K — UI scale down',
+        'ui_up': 'L — UI scale up',
+    }
     state['gna_running'] = _gna_running
     state['gna_allowed'] = _gna_allowed
     try:
@@ -25543,7 +25793,7 @@ except ImportError as _gna_imp_err:
 if _GNA_DEPS_AVAILABLE:
     import argparse
     import contextlib
-    import datetime
+    import datetime as _dt_mod          # module alias so GNA can use _dt_mod.datetime
     import ipaddress
     import math
     import queue
@@ -28088,7 +28338,7 @@ if _GNA_DEPS_AVAILABLE:
 
         def _emit_json(self, d: Deduction):
             record = {
-                'timestamp': datetime.datetime.fromtimestamp(d.timestamp).isoformat(),
+                'timestamp': _dt_mod.datetime.fromtimestamp(d.timestamp).isoformat(),
                 'severity': d.severity, 'category': d.category,
                 'process': d.process_name, 'pid': d.pid,
                 'message': d.message, 'evidence': d.evidence, 'score': d.score,
@@ -28176,7 +28426,7 @@ if _GNA_DEPS_AVAILABLE:
                 conn.execute(
                     "INSERT INTO deductions (timestamp, severity, category, process, pid, message, evidence, score) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    (datetime.datetime.fromtimestamp(d.timestamp).isoformat(),
+                    (_dt_mod.datetime.fromtimestamp(d.timestamp).isoformat(),
                      d.severity, d.category, d.process_name, d.pid,
                      d.message, json.dumps(d.evidence), d.score))
                 conn.commit()
@@ -28195,8 +28445,8 @@ if _GNA_DEPS_AVAILABLE:
                     "first_seen, last_seen, confidence) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (key, dev.get('mac'), dev.get('ip'), dev.get('vendor'),
                      dev.get('hostname'), dev.get('os_guess'),
-                     datetime.datetime.fromtimestamp(dev.get('first_seen', 0)).isoformat(),
-                     datetime.datetime.fromtimestamp(dev.get('last_seen', 0)).isoformat(),
+                     _dt_mod.datetime.fromtimestamp(dev.get('first_seen', 0)).isoformat(),
+                     _dt_mod.datetime.fromtimestamp(dev.get('last_seen', 0)).isoformat(),
                      dev.get('confidence', 0)))
                 conn.commit()
             except Exception as exc:
@@ -29460,7 +29710,7 @@ if _GNA_DEPS_AVAILABLE:
             if success:
                 meta = {
                     'ip': ip,
-                    'time_blocked': datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    'time_blocked': _dt_mod.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                     'service': (conn_info or {}).get('service', '?'),
                     'domain': (conn_info or {}).get('domain', '?'),
                     'process': (conn_info or {}).get('process', '?'),
@@ -31268,7 +31518,7 @@ if _GNA_DEPS_AVAILABLE:
         # ====================== EXPORT HTML REPORT ======================
         def _export_html_report(self):
             data = self._get_full_data()
-            ts = datetime.datetime.now().strftime("%Y-%m-%d_%H%M%S")
+            ts = _dt_mod.datetime.now().strftime("%Y-%m-%d_%H%M%S")
             desktop = os.path.join(os.path.expanduser("~"), "Desktop")
             filepath = os.path.join(desktop, f"GNA_Report_{ts}.html")
             html = ['<!DOCTYPE html><html><head><meta charset="utf-8">',
@@ -31285,7 +31535,7 @@ if _GNA_DEPS_AVAILABLE:
                     '.badge-yellow{background:#f5a623;color:black}',
                     '</style></head><body>',
                     f'<h1>GNA Tracer Security Report</h1>',
-                    f'<p>Generated: {datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</p>']
+                    f'<p>Generated: {_dt_mod.datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</p>']
             # Summary
             stats = data.get('conn_stats', {})
             html.append('<h2>Summary</h2><table>')
@@ -31515,7 +31765,7 @@ if _GNA_DEPS_AVAILABLE:
                 active = entry.get('active', False)
                 duration = entry.get('duration', 0)
                 start = entry.get('start_time', 0)
-                start_str = datetime.datetime.fromtimestamp(start).strftime("%H:%M:%S") if start else '?'
+                start_str = _dt_mod.datetime.fromtimestamp(start).strftime("%H:%M:%S") if start else '?'
                 dur_str = f"{int(duration)}s" if duration < 3600 else f"{duration/3600:.1f}h"
                 star = " ★" if rip in self._watchlist_ips else ""
                 if active:
@@ -31627,9 +31877,9 @@ if _GNA_DEPS_AVAILABLE:
             desktop = os.path.join(os.path.expanduser("~"), "Desktop")
             filepath = os.path.join(desktop, f"GNA tracer data {self._save_counter}.txt")
             data = self._get_full_data()
-            ts_now = datetime.datetime.now()
+            ts_now = _dt_mod.datetime.now()
             ts = ts_now.strftime("%Y-%m-%d %H:%M:%S")
-            start_ts = datetime.datetime.fromtimestamp(self._session_start).strftime("%Y-%m-%d %H:%M:%S")
+            start_ts = _dt_mod.datetime.fromtimestamp(self._session_start).strftime("%Y-%m-%d %H:%M:%S")
             elapsed = time.time() - self._session_start
             hrs, rem = divmod(int(elapsed), 3600)
             mins, secs = divmod(rem, 60)
@@ -31937,7 +32187,7 @@ if _GNA_DEPS_AVAILABLE:
         if not ts or ts == 0:
             return "N/A"
         try:
-            return datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+            return _dt_mod.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
         except Exception:
             return str(ts)
 
@@ -32161,7 +32411,7 @@ if _GNA_DEPS_AVAILABLE:
         _ANSI_RE = re.compile(r'\033\[[0-9;]*m')
 
         def _log(self, msg, color=Colors.Y):
-            ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            ts = _dt_mod.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             line = f"{ts} {color}{msg}{Colors.END}"
             print(line)
             # Capture to terminal buffer with color tag for GUI
@@ -32226,7 +32476,7 @@ if _GNA_DEPS_AVAILABLE:
             ts = time.time()
             event = {
                 'timestamp': ts,
-                'time': datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S"),
+                'time': _dt_mod.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S"),
                 'category': category,
                 'severity': severity,
                 'process': process,
@@ -32249,7 +32499,7 @@ if _GNA_DEPS_AVAILABLE:
                     return
 
         def _write_action(self, pid, name, action, extra=""):
-            ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            ts = _dt_mod.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             entry = f"{ts} | {name} (PID {pid}) | {action} {extra}"
             logging.getLogger('medianbox.actions').info(entry)
             with self.lock:
@@ -32258,7 +32508,7 @@ if _GNA_DEPS_AVAILABLE:
             self._auto_flag_action(pid, name, action, extra)
 
         def _write_deduction_log(self, d: Deduction):
-            ts = datetime.datetime.fromtimestamp(d.timestamp).strftime("%Y-%m-%d %H:%M:%S")
+            ts = _dt_mod.datetime.fromtimestamp(d.timestamp).strftime("%Y-%m-%d %H:%M:%S")
             entry = (f"{ts} | [{d.severity}] [{d.category}] {d.process_name} (PID {d.pid}) | "
                      f"{d.message} | score={d.score:.1f} | evidence={d.evidence}")
             logging.getLogger('medianbox.deductions').info(entry)
@@ -33230,7 +33480,7 @@ if _GNA_DEPS_AVAILABLE:
                 deductions_list = []
                 for d in list(self.deductions)[-100:]:
                     deductions_list.append({
-                        'time': datetime.datetime.fromtimestamp(d.timestamp).strftime("%H:%M:%S"),
+                        'time': _dt_mod.datetime.fromtimestamp(d.timestamp).strftime("%H:%M:%S"),
                         'severity': d.severity, 'category': d.category,
                         'process': d.process_name, 'pid': d.pid,
                         'message': d.message, 'score': round(d.score, 1),
@@ -33262,7 +33512,7 @@ if _GNA_DEPS_AVAILABLE:
                 for pid, actions in list(self.process_actions.items()):
                     for ts, name, action, extra in actions:
                         all_actions.append(
-                            f"{datetime.datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S')} | "
+                            f"{_dt_mod.datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S')} | "
                             f"{name} (PID {pid}) | {action} {extra}"
                         )
             all_actions.sort()
@@ -33272,7 +33522,7 @@ if _GNA_DEPS_AVAILABLE:
                 full_deds = []
                 for d in list(self.deductions):
                     full_deds.append({
-                        'time': datetime.datetime.fromtimestamp(d.timestamp).strftime("%H:%M:%S"),
+                        'time': _dt_mod.datetime.fromtimestamp(d.timestamp).strftime("%H:%M:%S"),
                         'severity': d.severity, 'category': d.category,
                         'process': d.process_name, 'pid': d.pid,
                         'message': d.message, 'score': round(d.score, 1),
@@ -44886,6 +45136,8 @@ MAX_PHYSICS_SUBSTEPS = 48  # Cap sub-steps per frame â€” higher for smoothe
 _gc_frame_counter = 0  # Periodic GC counter for indefinite runtime
 def update(dt):
     global total_fps, time_factor, V_total, V_total_percent, V_subfactors, current_fps, simulation_time, frame_count, last_fps_time, selected_particle, physics_accumulator, _gc_frame_counter, selected_cluster, _sphere_snap_counter, expansion_scale, cloud_radius, _sound_update_counter, _render_alpha, _det_playhead, _det_frames, vtotal_manual, _reverse_live_mode, paused, _pause_start_time, _afk_enabled, _afk_auto_unpause, _replay_active
+    # Pyglet 2.x: window must be explicitly invalidated each frame to trigger on_draw
+    window.invalid = True
     # Cap dt to prevent spiral-of-death from OS sleep/lag spikes
     dt = min(dt, 0.25)
     # Performance governor: record frame time and adapt quality
@@ -51334,6 +51586,121 @@ def _deferred_subconscious_init():
     print("[DeferredInit] All SubconsciousEngines initialized.")
 
 threading.Thread(target=_deferred_subconscious_init, daemon=True, name="DeferredSubconscious").start()
+
+# === CS.py World State Exporter ===
+def _export_cs_world_state():
+    """Background thread: writes comprehensive world_state.json for CS.py viewer."""
+    import json as _ej
+    _ws_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'world_state.json')
+    _ws_tmp = _ws_path + '.tmp'
+    time.sleep(8.0)  # Let simulation start up
+    while True:
+        time.sleep(3.0)
+        try:
+            if _observer_mgr is None or not _observer_mgr.observers:
+                continue
+            _d = {
+                'ts': time.time(), 'sim_time': simulation_time,
+                'tf': time_factor, 'paused': paused,
+                'n_particles': len(particles),
+                'n_atoms': sum(1 for p in particles if getattr(p, 'is_atom', False)),
+                'observers': [], 'chat': [], 'actions': [],
+            }
+            for _ob in _observer_mgr.observers:
+                _od = {
+                    'name': _ob.name, 'active': bool(_ob.active),
+                    'phi': float(_ob.phi), 'fe': float(_ob.free_energy),
+                    'goal': str(_ob.current_goal), 'step': int(_ob.training_step),
+                    'acts': int(_ob.total_actions), 'ok_acts': int(_ob.successful_actions),
+                    'conflicts': int(_ob.conflicts_lost),
+                    'curiosity': float(_ob.curiosity), 'boldness': float(_ob.boldness),
+                    'patience': float(_ob.patience), 'coop': float(_ob.cooperation),
+                    'goals': {str(k): float(v) for k, v in _ob.goal_progress.items()},
+                    'n_knowledge': len(_ob.knowledge),
+                    'topics': list(_ob.knowledge.keys())[:25],
+                    'n_symbols': len(_ob.symbols),
+                    'symbols': {},
+                    'phi_hist': [float(x) for x in list(_ob.phi_history)[-120:]],
+                    'thoughts': [],
+                }
+                try:
+                    for _sk, _sv in list(_ob.symbols.items())[:20]:
+                        _od['symbols'][str(_sk)] = float(getattr(_sv, 'value', 0))
+                except Exception:
+                    pass
+                try:
+                    _od['thoughts'] = [(str(t), str(m)[:80]) for t, m in list(_ob.thought_log)[-15:]]
+                except Exception:
+                    pass
+                try:
+                    _zd = _ob.zero_dim
+                    _od['phil'] = {'S': float(_zd.S_meta), 'C': float(_zd.C_consciousness), 'pct': float(_zd.get_totality_progress())}
+                except Exception:
+                    pass
+                try:
+                    _od['evo'] = {'gen': int(_ob.evolver.generation), 'pruned': int(_ob.evolver.n_pruned)}
+                except Exception:
+                    pass
+                try:
+                    if _NX and _ob._pgraph:
+                        _od['pgraph'] = {'nodes': _ob._pgraph.number_of_nodes(), 'edges': _ob._pgraph.number_of_edges()}
+                except Exception:
+                    pass
+                try:
+                    if _ob.math_embodiment.felt_errors:
+                        _od['felt'] = {str(k): float(v) for k, v in list(_ob.math_embodiment.felt_errors.items())[:10]}
+                except Exception:
+                    pass
+                for _sb in _shadow_bodies:
+                    if _sb.obs_id == _ob.name:
+                        _od['shadow'] = {'pos': [float(x) for x in _sb.pos], 'anim': str(_sb.anim_state)}
+                        try:
+                            if hasattr(_sb, 'neural_activations'):
+                                _od['neural_act'] = [float(x) for x in _sb.neural_activations[:64]]
+                        except Exception:
+                            pass
+                        try:
+                            if hasattr(_sb, 'senses'):
+                                _od['senses'] = {str(k): float(v.get('intensity', 0)) for k, v in _sb.senses.items()}
+                        except Exception:
+                            pass
+                        try:
+                            if hasattr(_sb, 'life_aura_energy'):
+                                _od['aura'] = {'e': float(_sb.life_aura_energy), 'r': float(_sb.life_aura_radius)}
+                        except Exception:
+                            pass
+                        try:
+                            if hasattr(_sb, 'neural_layer_sizes'):
+                                _od['layers'] = list(_sb.neural_layer_sizes)
+                            if hasattr(_sb, '_neural_nodes'):
+                                _od['n_neural_nodes'] = len(_sb._neural_nodes)
+                                _od['n_neural_edges'] = len(_sb._neural_edges)
+                        except Exception:
+                            pass
+                        try:
+                            if hasattr(_sb, 'neural_weights_sample'):
+                                _od['weights'] = [[float(v) for v in _wm.flatten()[:16]] for _wm in _sb.neural_weights_sample[:3]]
+                        except Exception:
+                            pass
+                        break
+                _d['observers'].append(_od)
+            try:
+                for _ct, _cs, _cr, _cm in list(_obs_chat_log)[-50:]:
+                    _d['chat'].append([float(_ct), str(_cs), str(_cr), str(_cm)[:120]])
+            except Exception:
+                pass
+            try:
+                for _at, _an, _aa, _ad, _aok in list(_obs_activity_log)[-50:]:
+                    _d['actions'].append([float(_at) if isinstance(_at, (int, float)) else 0, str(_an), str(_aa), str(_ad)[:60], bool(_aok)])
+            except Exception:
+                pass
+            with open(_ws_tmp, 'w') as _f:
+                _ej.dump(_d, _f)
+            os.replace(_ws_tmp, _ws_path)
+        except Exception:
+            pass
+
+threading.Thread(target=_export_cs_world_state, daemon=True, name="CSWorldExport").start()
 
 # Schedule
 pyglet.clock.schedule_interval(update, 1.0 / TARGET_FPS)

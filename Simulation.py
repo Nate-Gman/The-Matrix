@@ -14577,6 +14577,16 @@ if _TORCH:
 
     _SUBCONSCIOUS_AVAILABLE = True
 
+# Fallback _CS_CONFIG when PyTorch is unavailable (referenced by observer OS-awareness code)
+if '_CS_CONFIG' not in dir():
+    _CS_CONFIG = {
+        "hidden_size": 1024, "num_layers": 8, "num_heads": 8,
+        "vocab_size": 8000, "learning_rate": 3e-4, "phi_weight": 0.4,
+        "temperature": 0.85, "top_k": 50, "top_p": 0.92,
+        "screenshot_interval": 15, "os_control_enabled": False,
+        "voice_enabled": True,
+    }
+
 # Restore pyglet Label after CS.py integration (CS.py imports tkinter Label)
 try:
     from pyglet.text import Label
@@ -21647,7 +21657,7 @@ _OBS_SSM_N     = 16
 _OBS_MEM_SLOTS = 32
 _OBS_MEM_DIM   = 64
 _OBS_VIS_DIM   = 32
-_OBS_FEAT_DIM  = 56
+_OBS_FEAT_DIM  = 72  # 56 original + 16 OS awareness features
 _OBS_N_LAWS    = len(PHYSICS_LAWS)
 _OBS_PC_LEVELS = 3
 _OBS_N_ACTIONS = len(OBS_ACTIONS)
@@ -22204,7 +22214,7 @@ def _compute_phi_iit(state_vectors, n_partitions=20):
     for i in range(n_units):
         seg = W[i * (len(W) // n_units):(i + 1) * (len(W) // n_units)]
         if len(seg) > 1:
-            norm_seg = (seg - seg.min()) / (seg.ptp() + 1e-12)
+            norm_seg = (seg - seg.min()) / (seg.max() - seg.min() + 1e-12)
             for row in range(min(n_tpm, len(norm_seg))):
                 tpm[row % n_tpm, i] = np.clip(norm_seg[row % len(norm_seg)], 0.01, 0.99)
     detail.tpm_shape = tpm.shape
@@ -23597,11 +23607,15 @@ class ObserverManager:
             return
         dt = current_time - self._last_update
         self._last_update = current_time
+        if _diag_frame_num <= 3: _diag_file.write(f"frame#{_diag_frame_num} MGR-pre-obs-loop n_obs={len(self.observers)}\n"); _diag_file.flush()
         for obs in self.observers:
             if obs.active:
                 try:
+                    if _diag_frame_num <= 3: _diag_file.write(f"frame#{_diag_frame_num} MGR-obs-{obs.name}-perceive\n"); _diag_file.flush()
                     obs.perceive(sim_state)
+                    if _diag_frame_num <= 3: _diag_file.write(f"frame#{_diag_frame_num} MGR-obs-{obs.name}-think\n"); _diag_file.flush()
                     obs.think()
+                    if _diag_frame_num <= 3: _diag_file.write(f"frame#{_diag_frame_num} MGR-obs-{obs.name}-decide\n"); _diag_file.flush()
                     obs.decide(current_time)
                 except Exception as _obs_e:
                     obs._log_thought(f"[ERROR] {type(_obs_e).__name__}: {_obs_e}")
@@ -23621,6 +23635,7 @@ class ObserverManager:
                         sb.set_talk(msg, 3.5)
                     elif sb.obs_id == recipient.name:
                         sb.set_talk(f"({_nlc_pick(_NLC_VERBS_SENSE, recipient.qualia_vector[3], recipient.phi, recipient.curiosity)} {sender.name})", 2.0)
+        if _diag_frame_num <= 3: _diag_file.write(f"frame#{_diag_frame_num} MGR-pre-shadow-update\n"); _diag_file.flush()
         # Update shadow bodies
         for i, obs in enumerate(self.observers):
             if i < len(_shadow_bodies):
@@ -23635,6 +23650,7 @@ class ObserverManager:
                 obs.perceived_state['life_aura_radius'] = _sb.life_aura_radius
                 obs.perceived_state['body_pos'] = _sb.pos.tolist()
                 obs.perceived_state['anim_state'] = _sb.anim_state
+        if _diag_frame_num <= 3: _diag_file.write(f"frame#{_diag_frame_num} MGR-pre-perception-pass\n"); _diag_file.flush()
         # Body perception pass (after all bodies updated)
         for i, obs in enumerate(self.observers):
             if i < len(_shadow_bodies):
@@ -23658,6 +23674,7 @@ class ObserverManager:
                             if _dist_to_focus > 50.0:
                                 _shadow_bodies[i].teleport_to(_fp.pos)
                             break
+        if _diag_frame_num <= 3: _diag_file.write(f"frame#{_diag_frame_num} MGR-pre-collision\n"); _diag_file.flush()
         # Collision avoidance pass — push overlapping bodies apart
         for _sb in _shadow_bodies:
             _sb.separate_from_bodies(_shadow_bodies)
@@ -25281,6 +25298,40 @@ def _obs_chat(sender_name, recipient_name, message):
 # === Observer Consciousness System globals ===
 _observer_mgr = ObserverManager() if _OBSERVER_AVAILABLE else None
 show_observer_panel = False       # ; toggles this panel
+
+# --- Background observer thread: run think()/perceive()/decide() off the main thread ---
+_obs_bg_state_lock = threading.Lock()
+_obs_bg_pending_state = None      # latest sim state queued for observers
+_obs_bg_resolved_actions = []     # actions produced by last update cycle
+_obs_bg_actions_lock = threading.Lock()
+_obs_bg_busy = False              # True while background update is running
+
+def _obs_background_worker():
+    """Background thread: processes observer updates so think() never stalls the render loop."""
+    global _obs_bg_pending_state, _obs_bg_busy, _obs_bg_resolved_actions
+    while True:
+        try:
+            with _obs_bg_state_lock:
+                state = _obs_bg_pending_state
+                _obs_bg_pending_state = None
+            if state is not None and _observer_mgr is not None:
+                _obs_bg_busy = True
+                try:
+                    _observer_mgr.update(state, time.time())
+                    acts = _observer_mgr.get_resolved_actions()
+                    with _obs_bg_actions_lock:
+                        del _obs_bg_resolved_actions[:]
+                        _obs_bg_resolved_actions.extend(acts)
+                except Exception as _obg_e:
+                    pass
+                finally:
+                    _obs_bg_busy = False
+            else:
+                time.sleep(0.01)
+        except Exception:
+            time.sleep(0.02)
+
+threading.Thread(target=_obs_background_worker, daemon=True, name="ObserverBG").start()
 _observer_panel_highlight = 0     # 0=OB1..4=OB5
 # Create one shadow body per observer
 _shadow_bodies = []
@@ -25312,6 +25363,8 @@ _observer_full_data_cache = {}  # cached full particle/molecule data
 _observer_os_info_cache = {}   # cached OS info (platform never changes)
 _observer_psutil_counter = 0   # throttle psutil calls (expensive system calls)
 _observer_psutil_cache = {}    # cached psutil results
+_observer_os_full_counter = 0  # throttle full OS environment scan
+_observer_os_full_cache = {}   # cached full OS environment data (processes, windows, GPU, etc.)
 _observer_src_path_cache = None  # cached source file path (never changes)
 _observer_src_stat_cache = {}    # cached source file mtime/size
 _observer_src_stat_counter = 0   # throttle filesystem stat calls
@@ -25536,6 +25589,7 @@ def _get_sim_state_for_observers():
         except Exception:
             _observer_os_info_cache = {}
     state['os_info'] = dict(_observer_os_info_cache)
+    if _diag_frame_num <= 3: _diag_file.write(f"frame#{_diag_frame_num} OBS-pre-psutil\n"); _diag_file.flush()
     # Psutil calls throttled to every 30th call (~90 frames) — expensive system calls
     _observer_psutil_counter += 1
     if _observer_psutil_counter >= 30 or not _observer_psutil_cache:
@@ -25550,6 +25604,155 @@ def _get_sim_state_for_observers():
         except Exception:
             _observer_psutil_cache = {}
     state['os_info'].update(_observer_psutil_cache)
+    if _diag_frame_num <= 3: _diag_file.write(f"frame#{_diag_frame_num} OBS-pre-full-os\n"); _diag_file.flush()
+    # === FULL OS AWARENESS: processes, windows, GPU, disk, network, launched programs ===
+    # Comprehensive OS visibility so the AI understands the complete environment.
+    # Throttled to every 60th call (~180 frames / ~3 sec) to avoid performance impact.
+    global _observer_os_full_counter, _observer_os_full_cache
+    _observer_os_full_counter += 1
+    if _observer_os_full_counter >= 60 or not _observer_os_full_cache:
+        _observer_os_full_counter = 0
+        _os_full = {}
+        try:
+            import psutil as _psu2
+            # --- Running processes (top 30 by memory, non-system) ---
+            _procs = []
+            for _proc in _psu2.process_iter(['pid', 'name', 'cpu_percent', 'memory_percent', 'status', 'username']):
+                try:
+                    _pi = _proc.info
+                    if _pi.get('memory_percent', 0) and _pi['memory_percent'] > 0.05:
+                        _procs.append({
+                            'pid': _pi['pid'], 'name': _pi['name'],
+                            'cpu': round(_pi.get('cpu_percent', 0), 1),
+                            'mem_pct': round(_pi['memory_percent'], 2),
+                            'status': _pi.get('status', ''),
+                            'user': (_pi.get('username') or '').split('\\')[-1],
+                        })
+                except Exception:
+                    pass
+            _procs.sort(key=lambda x: x['mem_pct'], reverse=True)
+            _os_full['running_processes'] = _procs[:30]
+            _os_full['total_processes'] = len(_psu2.pids()) if hasattr(_psu2, 'pids') else len(_procs)
+            # --- Disk usage (all mounted drives) ---
+            _disks = []
+            for _dp in _psu2.disk_partitions():
+                try:
+                    _du = _psu2.disk_usage(_dp.mountpoint)
+                    _disks.append({
+                        'drive': _dp.mountpoint, 'fstype': _dp.fstype,
+                        'total_gb': round(_du.total / (1024**3), 1),
+                        'used_gb': round(_du.used / (1024**3), 1),
+                        'free_gb': round(_du.free / (1024**3), 1),
+                        'percent': _du.percent,
+                    })
+                except (PermissionError, OSError):
+                    pass
+            _os_full['disk_drives'] = _disks
+            # --- Network interfaces & IO ---
+            _net_if = {}
+            for _iface, _addrs in _psu2.net_if_addrs().items():
+                for _a in _addrs:
+                    if _a.family == 2:  # AF_INET (IPv4)
+                        _net_if[_iface] = _a.address
+            _os_full['network_interfaces'] = _net_if
+            _net_io = _psu2.net_io_counters()
+            _os_full['network_io'] = {
+                'bytes_sent': _net_io.bytes_sent, 'bytes_recv': _net_io.bytes_recv,
+                'packets_sent': _net_io.packets_sent, 'packets_recv': _net_io.packets_recv,
+            }
+            # --- CPU details ---
+            _os_full['cpu_count_physical'] = _psu2.cpu_count(logical=False) or 0
+            _os_full['cpu_count_logical'] = _psu2.cpu_count(logical=True) or 0
+            _os_full['cpu_freq_mhz'] = round((_psu2.cpu_freq().current if _psu2.cpu_freq() else 0), 0)
+            # --- Boot / uptime ---
+            _os_full['boot_time'] = _psu2.boot_time()
+            _os_full['uptime_hours'] = round((time.time() - _psu2.boot_time()) / 3600.0, 1)
+        except Exception:
+            pass
+        if _diag_frame_num <= 3: _diag_file.write(f"frame#{_diag_frame_num} OBS-pre-enumwindows\n"); _diag_file.flush()
+        # --- Open windows (Win32 API — visible window titles) ---
+        if sys.platform == 'win32':
+            try:
+                import ctypes as _ct_win
+                _GetWindowTextW = _ct_win.windll.user32.GetWindowTextW
+                _GetWindowTextLengthW = _ct_win.windll.user32.GetWindowTextLengthW
+                _IsWindowVisible = _ct_win.windll.user32.IsWindowVisible
+                _GetWindowThreadProcessId = _ct_win.windll.user32.GetWindowThreadProcessId
+                _GetForegroundWindow = _ct_win.windll.user32.GetForegroundWindow
+                _open_windows = []
+                _fg_hwnd = _GetForegroundWindow()
+                def _enum_cb(hwnd, _):
+                    if _IsWindowVisible(hwnd):
+                        _tlen = _GetWindowTextLengthW(hwnd)
+                        if _tlen > 0:
+                            _buf = _ct_win.create_unicode_buffer(_tlen + 1)
+                            _GetWindowTextW(hwnd, _buf, _tlen + 1)
+                            _title = _buf.value.strip()
+                            if _title and _title not in ('Program Manager', 'Windows Input Experience'):
+                                _wpid = _ct_win.c_ulong(0)
+                                _GetWindowThreadProcessId(hwnd, _ct_win.byref(_wpid))
+                                _open_windows.append({
+                                    'title': _title[:120],
+                                    'hwnd': hwnd,
+                                    'pid': _wpid.value,
+                                    'is_foreground': (hwnd == _fg_hwnd),
+                                })
+                    return True
+                _WNDENUMPROC = _ct_win.WINFUNCTYPE(_ct_win.c_bool, _ct_win.POINTER(_ct_win.c_int), _ct_win.POINTER(_ct_win.c_int))
+                _ct_win.windll.user32.EnumWindows(_WNDENUMPROC(_enum_cb), 0)
+                _os_full['open_windows'] = _open_windows[:40]
+                _os_full['foreground_window'] = next((w['title'] for w in _open_windows if w.get('is_foreground')), '')
+            except Exception:
+                _os_full['open_windows'] = []
+                _os_full['foreground_window'] = ''
+        if _diag_frame_num <= 3: _diag_file.write(f"frame#{_diag_frame_num} OBS-post-enumwindows\n"); _diag_file.flush()
+        # --- GPU info (NVIDIA via torch) ---
+        try:
+            if _TORCH and torch.cuda.is_available():
+                _os_full['gpu'] = {
+                    'name': torch.cuda.get_device_name(0),
+                    'vram_total_mb': round(torch.cuda.get_device_properties(0).total_mem / (1024**2)),
+                    'vram_allocated_mb': round(torch.cuda.memory_allocated(0) / (1024**2)),
+                    'vram_reserved_mb': round(torch.cuda.memory_reserved(0) / (1024**2)),
+                    'cuda_version': torch.version.cuda or '',
+                }
+            else:
+                _os_full['gpu'] = {'name': 'N/A (no CUDA)', 'vram_total_mb': 0}
+        except Exception:
+            _os_full['gpu'] = {}
+        # --- Launched external programs (H=CS Viewer, INSERT=GNA, END=OS toggle) ---
+        _os_full['launched_programs'] = {
+            'cs_viewer': {'running': _cs_viewer_running, 'hotkey': 'H', 'desc': 'Consciousness data viewer (CS.py)'},
+            'gna': {'running': _gna_running, 'hotkey': 'INSERT', 'desc': 'Global Network Archive P2P service'},
+            'os_control': {'enabled': not _ai_os_input_blocked, 'hotkey': 'END', 'desc': 'AI OS keyboard/mouse control'},
+            'gna_terminal': {'visible': _gna_show_terminal, 'hotkey': 'DELETE', 'desc': 'GNA terminal overlay'},
+            'gna_browser': {'enabled': _gna_browser_control, 'hotkey': 'PAGEUP', 'desc': 'AI browser navigation control'},
+        }
+        # --- Environment flags relevant to AI capabilities ---
+        _os_full['env_flags'] = {
+            'CS_OS_CONTROL_ENABLED': os.environ.get('CS_OS_CONTROL_ENABLED', '0'),
+            'os_control_config': _CS_CONFIG.get('os_control_enabled', False),
+            'PATH_dirs': len(os.environ.get('PATH', '').split(os.pathsep)),
+            'CUDA_VISIBLE_DEVICES': os.environ.get('CUDA_VISIBLE_DEVICES', 'all'),
+        }
+        # --- Resource capability summary for intelligence progression ---
+        _os_full['resource_summary'] = {
+            'can_control_os': (not _ai_os_input_blocked
+                               and _CS_CONFIG.get('os_control_enabled', False)
+                               and os.environ.get('CS_OS_CONTROL_ENABLED', '0') == '1'),
+            'can_see_windows': True,
+            'can_see_processes': True,
+            'can_see_network': True,
+            'can_see_gpu': bool(_TORCH and torch.cuda.is_available()) if _TORCH else False,
+            'can_launch_gna': _gna_allowed and _GNA_DEPS_AVAILABLE,
+            'can_browse_internet': _gna_running and _gna_browser_control,
+            'gna_connections_visible': _gna_running,
+            'cs_viewer_data_visible': _cs_viewer_running,
+            'hotkey_programs': {'H': 'cs_viewer', 'INSERT': 'gna_launch', 'END': 'ai_os_toggle',
+                                'DELETE': 'gna_terminal', 'PAGEUP': 'gna_browser', 'PAGEDOWN': 'gna_kill'},
+        }
+        _observer_os_full_cache = _os_full
+    state['os_environment'] = dict(_observer_os_full_cache)
     # === FULL DATA ACCESS: simulation globals the AI can see ===
     state['fps'] = current_fps
     state['frame_count'] = frame_count
@@ -25604,6 +25807,7 @@ def _get_sim_state_for_observers():
         state['gna_terminal'] = []
     # === FULL DATA ACCESS: observer chat log ===
     state['observer_chat_log'] = [(t, s, r, m) for t, s, r, m in list(_obs_chat_log)[-30:]]
+    if _diag_frame_num <= 3: _diag_file.write(f"frame#{_diag_frame_num} OBS-pre-screencap\n"); _diag_file.flush()
     # Screen capture â€" every 5th call to avoid framebuffer overhead
     _observer_screen_counter += 1
     if _observer_screen_counter % 5 == 0:
@@ -25613,6 +25817,7 @@ def _get_sim_state_for_observers():
             state['screen_frame'] = None
     else:
         state['screen_frame'] = None
+    if _diag_frame_num <= 3: _diag_file.write(f"frame#{_diag_frame_num} OBS-return\n"); _diag_file.flush()
     return state
 
 def _create_atom_at_pos(z, pos):
@@ -45134,74 +45339,87 @@ def on_mouse_motion(x, y, dx, dy):
 
 MAX_PHYSICS_SUBSTEPS = 48  # Cap sub-steps per frame â€” higher for smoother high-speed motion
 _gc_frame_counter = 0  # Periodic GC counter for indefinite runtime
+_diag_last_update = 0.0
+_diag_frame_num = 0
+_diag_file = open(os.path.join(os.path.dirname(__file__) or '.', 'diag_frames.log'), 'w')
 def update(dt):
-    global total_fps, time_factor, V_total, V_total_percent, V_subfactors, current_fps, simulation_time, frame_count, last_fps_time, selected_particle, physics_accumulator, _gc_frame_counter, selected_cluster, _sphere_snap_counter, expansion_scale, cloud_radius, _sound_update_counter, _render_alpha, _det_playhead, _det_frames, vtotal_manual, _reverse_live_mode, paused, _pause_start_time, _afk_enabled, _afk_auto_unpause, _replay_active
-    # Pyglet 2.x: window must be explicitly invalidated each frame to trigger on_draw
-    window.invalid = True
-    # Cap dt to prevent spiral-of-death from OS sleep/lag spikes
-    dt = min(dt, 0.25)
-    # Performance governor: record frame time and adapt quality
-    _perf.record_frame(dt, len(particles))
-    _perf.maybe_adjust()
-    # Default render alpha to 0.0; overwritten by physics substep loop if active
-    _render_alpha = 0.0
-    # Periodic garbage collection every ~600 frames (~10s at 60fps)
-    _gc_frame_counter += 1
-    if _gc_frame_counter >= 600:
-        _gc_frame_counter = 0
-        gc.collect(generation=0)
-    # AFK auto-unpause: if paused for longer than _afk_auto_unpause seconds
-    if paused and _afk_enabled and _afk_auto_unpause > 0 and _pause_start_time > 0:
-        if time.time() - _pause_start_time >= _afk_auto_unpause:
-            paused = False
-            _pause_start_time = 0.0
-            physics_accumulator = 0.0
-            _history_log.append((simulation_time, f"[USER] AFK auto-unpause after {_afk_auto_unpause:.0f}s"))
-            if len(_history_log) > _history_max:
-                _history_log.pop(0)
-    if not paused and not show_menu and not show_input_popup and not sphere_nav_frozen:
-        # === Deterministic Time Travel: Replay Check ===
-        # Reverse time restores from recorded frames (byte-identical determinism).
-        # Forward within recorded range replays frames. Forward past = live physics.
-        # When reverse replay exhausts all frames, transitions to LIVE REVERSE PHYSICS
-        # which computes the simulation backward indefinitely (negative simulation_time).
-        _replay_active = False
-        # Reset reverse-live mode when user switches to forward time
-        if time_factor >= 0:
-            _reverse_live_mode = False
-        if (time_factor < 0 or _det_playhead >= 0) and _det_frames and not _reverse_live_mode:
-            if time_factor < 0:
-                # BACKWARD: step through recorded frames (guaranteed identical)
-                if _det_playhead < 0:
-                    _det_playhead = len(_det_frames) - 1
-                _step = max(1, int(abs(time_factor) * dt * 60))
-                _new_ph = _det_playhead - _step
-                if _new_ph < 0:
-                    # Exhausted recorded frames â€” transition to live reverse physics
-                    # Restore frame 0 state as starting point for live reverse
-                    _fr = _det_frames[0]
-                    simulation_time = _fr[0]
-                    expansion_scale = _fr[1]
-                    cloud_radius = _fr[2]
-                    V_total = _fr[3]
-                    V_total_percent = _fr[4]
-                    _restore_particle_states(particles, _fr[5])
-                    _det_playhead = -1
-                    vtotal_manual = False
-                    _reverse_live_mode = True
-                    # _replay_active stays False â€” fall through to live physics
-                else:
-                    _det_playhead = _new_ph
+    global total_fps, time_factor, V_total, V_total_percent, V_subfactors, current_fps, simulation_time, frame_count, last_fps_time, selected_particle, physics_accumulator, _gc_frame_counter, selected_cluster, _sphere_snap_counter, expansion_scale, cloud_radius, _sound_update_counter, _render_alpha, _det_playhead, _det_frames, vtotal_manual, _reverse_live_mode, paused, _pause_start_time, _afk_enabled, _afk_auto_unpause, _replay_active, _diag_last_update, _diag_frame_num
+    try:
+        _upd_t0 = time.perf_counter()
+        _diag_frame_num += 1
+        if _diag_frame_num <= 3 or (_diag_last_update > 0 and _diag_frame_num % 60 == 0):
+            _gap = (_upd_t0 - _diag_last_update) if _diag_last_update > 0 else 0.0
+            _diag_file.write(f"frame#{_diag_frame_num} dt={dt*1000:.1f}ms gap={_gap*1000:.1f}ms particles={len(particles)}\n")
+            _diag_file.flush()
+        _diag_last_update = _upd_t0
+        # Pyglet 2.x: window must be explicitly invalidated each frame to trigger on_draw
+        window.invalid = True
+        if _diag_frame_num <= 3: _diag_file.write(f"frame#{_diag_frame_num} CP1-window.invalid\n"); _diag_file.flush()
+        # Cap dt to prevent spiral-of-death from OS sleep/lag spikes
+        dt = min(dt, 0.25)
+        # Performance governor: record frame time and adapt quality
+        _perf.record_frame(dt, len(particles))
+        _perf.maybe_adjust()
+        # Default render alpha to 0.0; overwritten by physics substep loop if active
+        _render_alpha = 0.0
+        # Periodic garbage collection every ~600 frames (~10s at 60fps)
+        _gc_frame_counter += 1
+        if _gc_frame_counter >= 600:
+            _gc_frame_counter = 0
+            gc.collect(generation=0)
+        # AFK auto-unpause: if paused for longer than _afk_auto_unpause seconds
+        if paused and _afk_enabled and _afk_auto_unpause > 0 and _pause_start_time > 0:
+            if time.time() - _pause_start_time >= _afk_auto_unpause:
+                paused = False
+                _pause_start_time = 0.0
+                physics_accumulator = 0.0
+                _history_log.append((simulation_time, f"[USER] AFK auto-unpause after {_afk_auto_unpause:.0f}s"))
+                if len(_history_log) > _history_max:
+                    _history_log.pop(0)
+        if _diag_frame_num <= 3: _diag_file.write(f"frame#{_diag_frame_num} CP2-pre-physics paused={paused}\n"); _diag_file.flush()
+        if not paused and not show_menu and not show_input_popup and not sphere_nav_frozen:
+            # === Deterministic Time Travel: Replay Check ===
+            # Reverse time restores from recorded frames (byte-identical determinism).
+            # Forward within recorded range replays frames. Forward past = live physics.
+            # When reverse replay exhausts all frames, transitions to LIVE REVERSE PHYSICS
+            # which computes the simulation backward indefinitely (negative simulation_time).
+            _replay_active = False
+            # Reset reverse-live mode when user switches to forward time
+            if time_factor >= 0:
+                _reverse_live_mode = False
+            if (time_factor < 0 or _det_playhead >= 0) and _det_frames and not _reverse_live_mode:
+                if time_factor < 0:
+                    # BACKWARD: step through recorded frames (guaranteed identical)
+                    if _det_playhead < 0:
+                        _det_playhead = len(_det_frames) - 1
+                    _step = max(1, int(abs(time_factor) * dt * 60))
+                    _new_ph = _det_playhead - _step
+                    if _new_ph < 0:
+                        # Exhausted recorded frames â€” transition to live reverse physics
+                        # Restore frame 0 state as starting point for live reverse
+                        _fr = _det_frames[0]
+                        simulation_time = _fr[0]
+                        expansion_scale = _fr[1]
+                        cloud_radius = _fr[2]
+                        V_total = _fr[3]
+                        V_total_percent = _fr[4]
+                        _restore_particle_states(particles, _fr[5])
+                        _det_playhead = -1
+                        vtotal_manual = False
+                        _reverse_live_mode = True
+                        # _replay_active stays False â€” fall through to live physics
+                    else:
+                        _det_playhead = _new_ph
+                        _replay_active = True
+                elif _det_playhead >= 0 and _det_playhead < len(_det_frames) - 1:
+                    # FORWARD REPLAY: step forward through recorded frames
+                    _step = max(1, int(max(time_factor, 0.5) * dt * 60))
+                    _det_playhead = min(_det_playhead + _step, len(_det_frames) - 1)
                     _replay_active = True
-            elif _det_playhead >= 0 and _det_playhead < len(_det_frames) - 1:
-                # FORWARD REPLAY: step forward through recorded frames
-                _step = max(1, int(max(time_factor, 0.5) * dt * 60))
-                _det_playhead = min(_det_playhead + _step, len(_det_frames) - 1)
-                _replay_active = True
-                if _det_playhead >= len(_det_frames) - 1:
-                    _det_playhead = -1  # Reached end of recording, go live
-                    vtotal_manual = False
-                    _replay_active = False
+                    if _det_playhead >= len(_det_frames) - 1:
+                        _det_playhead = -1  # Reached end of recording, go live
+                        vtotal_manual = False
+                        _replay_active = False
             elif _det_playhead >= 0:
                 # Playhead active but at end â€” go live
                 _det_playhead = -1
@@ -45595,301 +45813,328 @@ def update(dt):
                     _history_log.append((simulation_time, f"Particles: {_pre_n} -> {_post_n} (delta {_post_n - _pre_n:+d})"))
                     if len(_history_log) > _history_max:
                         _history_log.pop(0)
-    # === Camera Focus Tracking (always active, even when paused/menu open) ===
-    # Runs unconditionally so V/N/X/4/5 focus is never broken by pause or panning.
-    # Uses render-interpolated position so camera matches the particle's drawn position.
-    # NOTE: _render_alpha is a global; use it directly (dir() inside functions omits globals)
-    if selected_particle:
-        _sp_prev = getattr(selected_particle, 'prev_pos', selected_particle.pos)
-        camera.pos = _sp_prev + (selected_particle.pos - _sp_prev) * _render_alpha
-    elif _nanotech_focus_idx >= 0 and _nanotech_focus_idx < len(nanotech_loaded):
-        _nt = nanotech_loaded[_nanotech_focus_idx]
-        _nt_prev = getattr(_nt, 'prev_pos', _nt.pos)
-        camera.pos = _nt_prev + (_nt.pos - _nt_prev) * _render_alpha
-    # === Observer Consciousness System: Always Perceive, Act Only When Unpaused ===
-    if _observer_mgr and _OBSERVER_AVAILABLE:
-        # Throttle expensive observer perception to every 3 frames (~20Hz)
-        # _get_sim_state_for_observers iterates all particles 3x per call
-        if frame_count % 3 == 0:
-            try:
-                _obs_state = _get_sim_state_for_observers()
-                _obs_state['ai_spawn_allowed'] = _ai_spawn_allowed
-                _observer_mgr.update(_obs_state, time.time())
-                if not paused:
-                    for _obs_entity, _obs_act, _obs_params in _observer_mgr.get_resolved_actions():
-                        _execute_observer_action(_obs_entity, _obs_act, _obs_params)
-                else:
-                    # While paused: AI still perceives and learns, but actions are queued
-                    _observer_mgr.get_resolved_actions()  # consume but discard
-            except Exception as _obs_main_err:
-                print(f"[Observer] Error: {type(_obs_main_err).__name__}: {_obs_main_err}")
-        _abs_st = abs(simulation_time)
-        _t_sign = "-" if simulation_time < 0 else ""
-        hours = int(_abs_st // 3600)
-        minutes = int((_abs_st % 3600) // 60)
-        seconds = int(_abs_st % 60)
-        _replay_tag = f" | REPLAY {_det_playhead}/{len(_det_frames)}" if _replay_active else ""
-        _rev_live_tag = " | REVERSE LIVE" if _reverse_live_mode else ""
-        _run_odds_tag = f" | RUN ODDS [{_self_assembly.run_odds_iterations:,}]" if _self_assembly.run_odds_active else ""
-        _gpu_tag = f" | GPU: {_PERF_GPU_NAME}" if _PERF_GPU_AVAILABLE else " | CPU-only"
-        simulation_label.text = f"T: {_t_sign}{hours:02d}h:{minutes:02d}m:{seconds:02d}s | Particles: {len(particles)}{_gpu_tag}{_replay_tag}{_rev_live_tag}{_run_odds_tag}"
-        _tf_pct = time_factor * 100.0
-        # Ratio display: express time_factor as a fraction (e.g. 1:2 = half speed)
-        _tf_abs = abs(time_factor)
-        if _tf_abs == 0:
-            _ratio_str = "0:1"
-        elif _tf_abs >= 1.0:
-            _ratio_str = f"{_tf_abs:.1f}:1"
-        else:
-            _ratio_str = f"1:{1.0/_tf_abs:.1f}"
-        _rev_tag = " (REVERSE)" if time_factor < 0 else ""
-        _extrap_tag = ""
-        if time_factor == 0:
-            time_factor_label.text = "Time Factor: 0% [0:1] (PAUSED)"
-        elif abs(_tf_pct) < 0.01:
-            time_factor_label.text = f"Time Factor: {_tf_pct:.2e}% [{_ratio_str}]{_rev_tag}{_extrap_tag}"
-        elif abs(_tf_pct) < 1.0:
-            time_factor_label.text = f"Time Factor: {_tf_pct:.6f}% [{_ratio_str}]{_rev_tag}{_extrap_tag}"
-        else:
-            time_factor_label.text = f"Time Factor: {_tf_pct:.1f}% [{_ratio_str}]{_rev_tag}{_extrap_tag}"
-        # Single-pass stats to avoid multiple list traversals (throttled to every 5 frames)
-        if frame_count % 5 != 0 and hasattr(update, '_cached_stats'):
-            total_mass, total_energy, n_atoms, n_independent, n_sub, n_stable, n_anti, total_charge, rank_score, quantum_bindings, _positions = update._cached_stats
-        else:
-            total_mass = 0.0
-            total_energy = 0.0
-            n_atoms = 0
-            n_independent = 0
-            n_sub = 0
-            n_stable = 0
-            n_anti = 0
-            total_charge = 0.0
-            rank_score = 0
-            quantum_bindings = 0
-            _positions = []
-            for p in particles:
-                total_mass += p.mass
-                total_energy += p.energy_kin + p.energy_rot
-                total_charge += p.charge
-                bt = getattr(p, 'base_type', '')
-                if bt != 'decayed':
-                    n_stable += 1
-                    _positions.append(p.pos)
-                if 'anti_' in bt:
-                    n_anti += 1
-                if p.is_atom:
-                    n_atoms += 1
-                    _nsub = len(p.sub_particles)
-                    n_sub += _nsub
-                    rank_score += 3 + 2 * _nsub
-                    quantum_bindings += _nsub
-                else:
-                    n_independent += 1
-                    rank_score += 1
-            update._cached_stats = (total_mass, total_energy, n_atoms, n_independent, n_sub, n_stable, n_anti, total_charge, rank_score, quantum_bindings, _positions)
-        # === V_total: Unified Reality-Weight (refined formula) ===
-        # Dimensional Sphere: INFINITY_MAP = 5,184,000 = practical infinity
-        # Formula: V = [5Â·(innerÂ²) + 1.001Â·VÂ·(VÂ²+V)Â·0.001V] Â· recursive Â· âˆž_norm Â· V
-        _rest_E = total_mass * c ** 2
-        E_energy = _rest_E + total_energy
-        T_minutes = abs(simulation_time) / 60.0
-        _tnorm = T_minutes / 1440.0 if T_minutes > 0 else 0.0
-        # 11 base subfactors
-        sf_Z = math.sqrt(abs(_rest_E) + EPSILON)
-        sf_A = float(n_stable)
-        if len(_positions) > 1:
-            _parr = np.array(_positions)
-            _cmean = np.mean(_parr, axis=0)
-            _dists = np.linalg.norm(_parr - _cmean, axis=1)
-            _spatial_r = float(np.mean(_dists))
-            _spatial_std = float(np.std(_parr))
-        else:
-            _spatial_r = 0.0
-            _spatial_std = 0.0
-        sf_C = math.sqrt(abs(math.pi * _spatial_r * _spatial_std) + EPSILON)
-        sf_E = 5.0 * E_energy
-        sf_Q = 13.0 * quantum_bindings / 2.0
-        sf_U = math.sqrt(float(len(particles)) + EPSILON)
-        sf_D = -float(n_anti)
-        sf_T = (7.0 ** 12) * _tnorm
-        sf_R = 9.0 * rank_score
-        sf_P = 780.0 * (V_total_percent / 100.0)
-        sf_B = -abs(total_charge)
-        # Base inner sum of 11 subfactors
-        _base = sf_Z + sf_A + sf_C + sf_E + sf_Q + sf_U + sf_D + sf_T + sf_R + sf_P + sf_B
-        # Normalize V_prev for recursive terms (map to 0..1 via INFINITY_MAP)
-        _Vn = min(abs(V_total) / INFINITY_MAP, 1.0) if V_total != 0 else 0.0
-        # Exponential term: sum(V^n/n!) = e^V (Taylor series)
-        _exp_term = math.exp(min(_Vn * 3.0, 20.0))
-        # Quadratic + infinity-scaled: VÂ² + VÂ·(âˆžÂ²/2)
-        _quad_term = _Vn ** 2 + _Vn * 0.5
-        # Cubic polynomial: (4VÂ² + 0.001V)Â³
-        _poly = 4.0 * _Vn ** 2 + 0.001 * _Vn
-        _cubic_term = _poly ** 3
-        # Duality and light: 2 + Ï€Â·V^1.5Â·0.137
-        _dual_term = 2.0 + math.pi * max(_Vn, EPSILON) ** 1.5 * 0.137
-        # Inner sum
-        _inner = _exp_term + _quad_term + _cubic_term + _dual_term + _base
-        # Squared inner: 5Â·(innerÂ²)
-        _inner = max(-1e150, min(_inner, 1e150))
-        _inner_sq = 5.0 * _inner ** 2
-        # Perturbation: 1.001Â·VÂ·(VÂ²+V)Â·0.001V
-        _perturb = 1.001 * _Vn * (_Vn ** 2 + _Vn) * 0.001 * _Vn
-        # Recursive power terms: V^V + V^(VÂ²) + V^(âˆšV) â€” capped in log space
-        _Vn_safe = max(_Vn, EPSILON)
-        _log_vv = min(_Vn_safe * math.log(max(_Vn_safe, 1e-10) + 1.0), 20.0)
-        _log_vv2 = min(_Vn_safe ** 2 * math.log(max(_Vn_safe, 1e-10) + 1.0), 20.0)
-        _log_vsqrt = min(math.sqrt(_Vn_safe) * math.log(max(_Vn_safe, 1e-10) + 1.0), 20.0)
-        _recursive = math.exp(_log_vv) + math.exp(_log_vv2) + math.exp(_log_vsqrt)
-        # Infinity normalization: time fraction of 24h cycle
-        _inf_norm = max(_tnorm, EPSILON)
-        # Final V_total: [5Â·innerÂ² + perturbation] Â· recursive Â· âˆž_norm
-        if not _replay_active:
-            V_total = (_inner_sq + _perturb) * _recursive * _inf_norm
-        # Auto-calculate percentage unless user manually set via slider
-        # V% = V_total / INFINITY_MAP * 100 â€” uncapped, reflects actual scale
-        # With limited atoms this is a smaller-scale infinity; V% shows true ratio
-        if not vtotal_manual:
-            V_total_percent = abs(V_total) / INFINITY_MAP * 100.0
-        # Store subfactors for F1 info display
-        V_subfactors = {'Z': sf_Z, 'A': sf_A, 'C': sf_C, 'E': sf_E, 'Q': sf_Q,
-                        'U': sf_U, 'D': sf_D, 'T': sf_T, 'R': sf_R, 'P': sf_P, 'B': sf_B,
-                        'exp': _exp_term, 'rec': _recursive, 'inf': _inf_norm}
-        # === 11-Dimensional String Theory: fractal decomposition of V_total ===
-        # infinity/11 â†’ fractal basis per dimension; V_total drives amplitudes & phases
-        # "Size of infinity" scales with total complexity (more exists â†’ larger infinity)
-        _dim11_infinity_scale = 1.0 + math.log10(max(abs(V_total), 1.0))
-        _abs_V = abs(V_total)
-        _subfactors_list = [sf_Z, sf_A, sf_C, sf_E, sf_Q, sf_U, sf_D, sf_T, sf_R, sf_P, sf_B]
-        for _di in range(STRING_DIMENSIONS):
-            # Each dimension gets a fractal slice: V_total mod (fractal_base * (d+1))
-            _dim_period = _STRING_FRACTAL_BASE * (_di + 1)
-            _dim_frac = (_abs_V % _dim_period) / max(_dim_period, 1e-20)
-            # Amplitude: subfactor contribution scaled by fractal fraction
-            _sf_val = abs(_subfactors_list[_di]) if _di < len(_subfactors_list) else _abs_V
-            _dim11_amplitudes[_di] = min(1.0, _dim_frac * (0.3 + 0.7 * min(_sf_val / max(_abs_V, 1e-20), 1.0)))
-            # Phase: golden-ratio-spaced rotation driven by time and V_total
-            _dim11_phases[_di] = (simulation_time * (0.1 + 0.05 * _di) + _dim_frac * math.pi * 2.0 * (_di + 1) / STRING_DIMENSIONS) % (2.0 * math.pi)
-        # Format V% with appropriate precision based on magnitude
-        if V_total_percent < 0.001:
-            _vpct_str = f"{V_total_percent:.6e}%"
-        elif V_total_percent < 1.0:
-            _vpct_str = f"{V_total_percent:.6f}%"
-        elif V_total_percent > 1000:
-            _vpct_str = f"{V_total_percent:.2e}%"
-        else:
-            _vpct_str = f"{V_total_percent:.4f}%"
-        v_total_label.text = f"V_total: {V_total:.2e}  ({_vpct_str})  M={total_mass:.2e}  Chg={total_charge:.2e}"
-        v_subfactors_label.text = f"E={E_energy:.2e}  R={sf_R:.0f}  Q={sf_Q:.0f}  T={sf_T:.2e}  Z={sf_Z:.1f}  A={sf_A:.0f}  Rec={_recursive:.2f}"
-        # Update V_total percentage slider fill (logarithmic scale for wide range)
-        if V_total_percent > 0:
-            _log_pct = math.log10(V_total_percent + 1) / math.log10(INFINITY_MAP + 1)
-            vtotal_slider_fill.width = min(_log_pct, 1.0) * vtotal_slider_width
-        else:
-            vtotal_slider_fill.width = 0
-        vtotal_pct_label.text = f"V%: {_vpct_str}"
-        # Save dimensional sphere snapshot and/or deterministic frame for time travel
-        # Share _record_particle_states result if both trigger in the same frame (expensive deep copy)
-        _frame_states = None
-        _need_sphere = not sphere_nav_frozen and not _replay_active
-        _need_det = not _replay_active and not _perf.skip_det_frames and (frame_count % _perf.det_record_interval == 0)
-        if _need_sphere:
-            _sphere_snap_counter += 1
-            if _sphere_snap_counter >= _perf.sphere_snap_interval:
-                _sphere_snap_counter = 0
-                _frame_states = _record_particle_states(particles)
-                _sphere_snapshots.append((simulation_time, V_total, V_total_percent, _frame_states))
-                if len(_sphere_snapshots) > _sphere_snap_max:
-                    _sphere_snapshots.pop(0)
-        if _need_det:
-            if _frame_states is None:
-                _frame_states = _record_particle_states(particles)
-            _det_frames.append((
-                simulation_time, expansion_scale, cloud_radius, V_total, V_total_percent,
-                _frame_states
-            ))
-            if len(_det_frames) > _det_frame_max:
-                _det_frames.pop(0)
-        # Fill bar: center=0, right=positive, left=negative
-        _half_w = slider_width // 2
-        _tf_vis = min(abs(time_factor) / max_time_factor, 1.0)  # visual fraction (capped at bar edge)
-        if time_factor > 0:
-            fill_bar.x = slider_x + _half_w
-            fill_bar.width = int(_tf_vis * _half_w)
-            fill_bar.color = _TH_BAR_FILL
-        elif time_factor < 0:
-            _neg_w = int(_tf_vis * _half_w)
-            fill_bar.x = slider_x + _half_w - _neg_w
-            fill_bar.width = _neg_w
-            fill_bar.color = (200, 100, 80, 255)  # Red for reverse
-        else:
-            fill_bar.x = slider_x + _half_w - 1
-            fill_bar.width = 2
-            fill_bar.color = (120, 120, 120, 255)  # Gray for paused
-        total_particle_label.text = f"Total Particles: {n_independent + n_sub}"
-        total_independent_label.text = f"Independent: {n_independent}"
-        total_atom_label.text = f"Atoms: {n_atoms}"
-        frame_count += 1
-        current_time = time.time()
-        if current_time - last_fps_time >= 1.0:
-            current_fps = frame_count / (current_time - last_fps_time)
-            frame_count = 0
-            last_fps_time = current_time
-        _q_names = ['SURV', 'LOW', 'MED', 'HIGH', 'ULTRA']
-        _q_tag = _q_names[min(_perf.quality, 4)]
-        _gpu_tag = ' GPU' if _perf.use_gpu_gravity else ''
-        fps_label.text = f"FPS: {current_fps:.1f} [{_q_tag}{_gpu_tag}]"
-        # Update nanotech entities (alive AND dead â€” dead ones drift and decompose)
-        # Respect pause: motor rotation, thrust, ion dynamics all freeze when paused
-        if not paused:
-            for _nt in nanotech_loaded:
-                _nt.update(dt, particles)
-        # Matter persists: dead entities remain as inert matter with residual energy/motion
-        # They are NEVER removed â€” only their physics state changes (no despawn)
-        # Process deferred observer window spawns (avoids pyglet Set iteration crash)
-        for _pending_target in _pending_observer_spawns:
-            try:
-                _obs = ObserverWindow(target_particle=_pending_target)
-                _observer_windows.append(_obs)
-            except Exception as _owe:
-                print(f"Failed to create observer window: {_owe}")
-        _pending_observer_spawns.clear()
-        # Invalidate observer windows so they redraw each frame
-        for _ow in _observer_windows:
-            if _ow._alive:
+        if _diag_frame_num <= 3: _diag_file.write(f"frame#{_diag_frame_num} CP3-pre-camera\n"); _diag_file.flush()
+        # === Camera Focus Tracking (always active, even when paused/menu open) ===
+        # Runs unconditionally so V/N/X/4/5 focus is never broken by pause or panning.
+        # Uses render-interpolated position so camera matches the particle's drawn position.
+        # NOTE: _render_alpha is a global; use it directly (dir() inside functions omits globals)
+        if selected_particle:
+            _sp_prev = getattr(selected_particle, 'prev_pos', selected_particle.pos)
+            camera.pos = _sp_prev + (selected_particle.pos - _sp_prev) * _render_alpha
+        elif _nanotech_focus_idx >= 0 and _nanotech_focus_idx < len(nanotech_loaded):
+            _nt = nanotech_loaded[_nanotech_focus_idx]
+            _nt_prev = getattr(_nt, 'prev_pos', _nt.pos)
+            camera.pos = _nt_prev + (_nt.pos - _nt_prev) * _render_alpha
+        if _diag_frame_num <= 3: _diag_file.write(f"frame#{_diag_frame_num} CP4-pre-observer\n"); _diag_file.flush()
+        # === Observer Consciousness System: Always Perceive, Act Only When Unpaused ===
+        if _diag_frame_num <= 3: _diag_file.write(f"frame#{_diag_frame_num} CP4a obs_mgr={bool(_observer_mgr)} avail={_OBSERVER_AVAILABLE}\n"); _diag_file.flush()
+        if _observer_mgr and _OBSERVER_AVAILABLE:
+            if _diag_frame_num <= 3: _diag_file.write(f"frame#{_diag_frame_num} CP4b inside-observer fc={frame_count}\n"); _diag_file.flush()
+            # Throttle expensive observer perception to every 3 frames (~20Hz)
+            # _get_sim_state_for_observers iterates all particles 3x per call
+            if frame_count % 3 == 0:
                 try:
-                    _ow._win.invalid = True
-                except Exception:
-                    pass
-    # Per-frame shadow body animation tick (smooth rendering independent of observer update rate)
-    # NOTE: anim_time, talk_timer, breath_phase, aura_pulse_phase, walk_phase, life_aura_phase
-    # are already incremented inside ShadowBody.update() â€” only update supplemental fields here
-    if _shadow_bodies:
-        for _sbf in _shadow_bodies:
-            # Smooth pose blending between frames
-            if _sbf._blend_t < 1.0:
-                _sbf._blend_t = min(1.0, _sbf._blend_t + dt * _sbf._blend_speed)
-                _sbf._current_pose = _lerp_pose(_sbf._current_pose, _sbf._target_pose,
-                                                  min(1.0, dt * _sbf._blend_speed * 2))
-            if _sbf.teleport_alpha < 1.0:
-                _sbf.teleport_alpha = min(1.0, _sbf.teleport_alpha + dt * 2.0)
+                    if _diag_frame_num <= 3: _diag_file.write(f"frame#{_diag_frame_num} CP4c pre-get_sim_state\n"); _diag_file.flush()
+                    _obs_state = _get_sim_state_for_observers()
+                    _obs_state['ai_spawn_allowed'] = _ai_spawn_allowed
+                    # Dispatch to background thread — never block the render loop
+                    if not _obs_bg_busy:
+                        with _obs_bg_state_lock:
+                            _obs_bg_pending_state = _obs_state
+                    if _diag_frame_num <= 3: _diag_file.write(f"frame#{_diag_frame_num} CP4d post-observer-update\n"); _diag_file.flush()
+                    if not paused:
+                        with _obs_bg_actions_lock:
+                            _pending_acts = list(_obs_bg_resolved_actions)
+                            del _obs_bg_resolved_actions[:]
+                        for _obs_entity, _obs_act, _obs_params in _pending_acts:
+                            _execute_observer_action(_obs_entity, _obs_act, _obs_params)
+                    else:
+                        with _obs_bg_actions_lock:
+                            del _obs_bg_resolved_actions[:]
+                except Exception as _obs_main_err:
+                    print(f"[Observer] Error: {type(_obs_main_err).__name__}: {_obs_main_err}")
+            if _diag_frame_num <= 3: _diag_file.write(f"frame#{_diag_frame_num} CP5-post-observer\n"); _diag_file.flush()
+            _abs_st = abs(simulation_time)
+            _t_sign = "-" if simulation_time < 0 else ""
+            hours = int(_abs_st // 3600)
+            minutes = int((_abs_st % 3600) // 60)
+            seconds = int(_abs_st % 60)
+            _replay_tag = f" | REPLAY {_det_playhead}/{len(_det_frames)}" if _replay_active else ""
+            _rev_live_tag = " | REVERSE LIVE" if _reverse_live_mode else ""
+            _run_odds_tag = f" | RUN ODDS [{_self_assembly.run_odds_iterations:,}]" if _self_assembly.run_odds_active else ""
+            _gpu_tag = f" | GPU: {_PERF_GPU_NAME}" if _PERF_GPU_AVAILABLE else " | CPU-only"
+            simulation_label.text = f"T: {_t_sign}{hours:02d}h:{minutes:02d}m:{seconds:02d}s | Particles: {len(particles)}{_gpu_tag}{_replay_tag}{_rev_live_tag}{_run_odds_tag}"
+            _tf_pct = time_factor * 100.0
+            # Ratio display: express time_factor as a fraction (e.g. 1:2 = half speed)
+            _tf_abs = abs(time_factor)
+            if _tf_abs == 0:
+                _ratio_str = "0:1"
+            elif _tf_abs >= 1.0:
+                _ratio_str = f"{_tf_abs:.1f}:1"
+            else:
+                _ratio_str = f"1:{1.0/_tf_abs:.1f}"
+            _rev_tag = " (REVERSE)" if time_factor < 0 else ""
+            _extrap_tag = ""
+            if time_factor == 0:
+                time_factor_label.text = "Time Factor: 0% [0:1] (PAUSED)"
+            elif abs(_tf_pct) < 0.01:
+                time_factor_label.text = f"Time Factor: {_tf_pct:.2e}% [{_ratio_str}]{_rev_tag}{_extrap_tag}"
+            elif abs(_tf_pct) < 1.0:
+                time_factor_label.text = f"Time Factor: {_tf_pct:.6f}% [{_ratio_str}]{_rev_tag}{_extrap_tag}"
+            else:
+                time_factor_label.text = f"Time Factor: {_tf_pct:.1f}% [{_ratio_str}]{_rev_tag}{_extrap_tag}"
+            # Single-pass stats to avoid multiple list traversals (throttled to every 5 frames)
+            if frame_count % 5 != 0 and hasattr(update, '_cached_stats'):
+                total_mass, total_energy, n_atoms, n_independent, n_sub, n_stable, n_anti, total_charge, rank_score, quantum_bindings, _positions = update._cached_stats
+            else:
+                total_mass = 0.0
+                total_energy = 0.0
+                n_atoms = 0
+                n_independent = 0
+                n_sub = 0
+                n_stable = 0
+                n_anti = 0
+                total_charge = 0.0
+                rank_score = 0
+                quantum_bindings = 0
+                _positions = []
+                for p in particles:
+                    total_mass += p.mass
+                    total_energy += p.energy_kin + p.energy_rot
+                    total_charge += p.charge
+                    bt = getattr(p, 'base_type', '')
+                    if bt != 'decayed':
+                        n_stable += 1
+                        _positions.append(p.pos)
+                    if 'anti_' in bt:
+                        n_anti += 1
+                    if p.is_atom:
+                        n_atoms += 1
+                        _nsub = len(p.sub_particles)
+                        n_sub += _nsub
+                        rank_score += 3 + 2 * _nsub
+                        quantum_bindings += _nsub
+                    else:
+                        n_independent += 1
+                        rank_score += 1
+                update._cached_stats = (total_mass, total_energy, n_atoms, n_independent, n_sub, n_stable, n_anti, total_charge, rank_score, quantum_bindings, _positions)
+            if _diag_frame_num <= 3: _diag_file.write(f"frame#{_diag_frame_num} CP6-pre-vtotal\n"); _diag_file.flush()
+        # === V_total: Unified Reality-Weight (refined formula) ===
+            # Dimensional Sphere: INFINITY_MAP = 5,184,000 = practical infinity
+            # Formula: V = [5Â·(innerÂ²) + 1.001Â·VÂ·(VÂ²+V)Â·0.001V] Â· recursive Â· âˆž_norm Â· V
+            _rest_E = total_mass * c ** 2
+            E_energy = _rest_E + total_energy
+            T_minutes = abs(simulation_time) / 60.0
+            _tnorm = T_minutes / 1440.0 if T_minutes > 0 else 0.0
+            # 11 base subfactors
+            sf_Z = math.sqrt(abs(_rest_E) + EPSILON)
+            sf_A = float(n_stable)
+            if len(_positions) > 1:
+                _parr = np.array(_positions)
+                _cmean = np.mean(_parr, axis=0)
+                _dists = np.linalg.norm(_parr - _cmean, axis=1)
+                _spatial_r = float(np.mean(_dists))
+                _spatial_std = float(np.std(_parr))
+            else:
+                _spatial_r = 0.0
+                _spatial_std = 0.0
+            sf_C = math.sqrt(abs(math.pi * _spatial_r * _spatial_std) + EPSILON)
+            sf_E = 5.0 * E_energy
+            sf_Q = 13.0 * quantum_bindings / 2.0
+            sf_U = math.sqrt(float(len(particles)) + EPSILON)
+            sf_D = -float(n_anti)
+            sf_T = (7.0 ** 12) * _tnorm
+            sf_R = 9.0 * rank_score
+            sf_P = 780.0 * (V_total_percent / 100.0)
+            sf_B = -abs(total_charge)
+            # Base inner sum of 11 subfactors
+            _base = sf_Z + sf_A + sf_C + sf_E + sf_Q + sf_U + sf_D + sf_T + sf_R + sf_P + sf_B
+            # Normalize V_prev for recursive terms (map to 0..1 via INFINITY_MAP)
+            _Vn = min(abs(V_total) / INFINITY_MAP, 1.0) if V_total != 0 else 0.0
+            # Exponential term: sum(V^n/n!) = e^V (Taylor series)
+            _exp_term = math.exp(min(_Vn * 3.0, 20.0))
+            # Quadratic + infinity-scaled: VÂ² + VÂ·(âˆžÂ²/2)
+            _quad_term = _Vn ** 2 + _Vn * 0.5
+            # Cubic polynomial: (4VÂ² + 0.001V)Â³
+            _poly = 4.0 * _Vn ** 2 + 0.001 * _Vn
+            _cubic_term = _poly ** 3
+            # Duality and light: 2 + Ï€Â·V^1.5Â·0.137
+            _dual_term = 2.0 + math.pi * max(_Vn, EPSILON) ** 1.5 * 0.137
+            # Inner sum
+            _inner = _exp_term + _quad_term + _cubic_term + _dual_term + _base
+            # Squared inner: 5Â·(innerÂ²)
+            _inner = max(-1e150, min(_inner, 1e150))
+            _inner_sq = 5.0 * _inner ** 2
+            # Perturbation: 1.001Â·VÂ·(VÂ²+V)Â·0.001V
+            _perturb = 1.001 * _Vn * (_Vn ** 2 + _Vn) * 0.001 * _Vn
+            # Recursive power terms: V^V + V^(VÂ²) + V^(âˆšV) â€” capped in log space
+            _Vn_safe = max(_Vn, EPSILON)
+            _log_vv = min(_Vn_safe * math.log(max(_Vn_safe, 1e-10) + 1.0), 20.0)
+            _log_vv2 = min(_Vn_safe ** 2 * math.log(max(_Vn_safe, 1e-10) + 1.0), 20.0)
+            _log_vsqrt = min(math.sqrt(_Vn_safe) * math.log(max(_Vn_safe, 1e-10) + 1.0), 20.0)
+            _recursive = math.exp(_log_vv) + math.exp(_log_vv2) + math.exp(_log_vsqrt)
+            # Infinity normalization: time fraction of 24h cycle
+            _inf_norm = max(_tnorm, EPSILON)
+            # Final V_total: [5Â·innerÂ² + perturbation] Â· recursive Â· âˆž_norm
+            if not _replay_active:
+                V_total = (_inner_sq + _perturb) * _recursive * _inf_norm
+            # Auto-calculate percentage unless user manually set via slider
+            # V% = V_total / INFINITY_MAP * 100 â€” uncapped, reflects actual scale
+            # With limited atoms this is a smaller-scale infinity; V% shows true ratio
+            if not vtotal_manual:
+                V_total_percent = abs(V_total) / INFINITY_MAP * 100.0
+            # Store subfactors for F1 info display
+            V_subfactors = {'Z': sf_Z, 'A': sf_A, 'C': sf_C, 'E': sf_E, 'Q': sf_Q,
+                            'U': sf_U, 'D': sf_D, 'T': sf_T, 'R': sf_R, 'P': sf_P, 'B': sf_B,
+                            'exp': _exp_term, 'rec': _recursive, 'inf': _inf_norm}
+            # === 11-Dimensional String Theory: fractal decomposition of V_total ===
+            # infinity/11 â†’ fractal basis per dimension; V_total drives amplitudes & phases
+            # "Size of infinity" scales with total complexity (more exists â†’ larger infinity)
+            _dim11_infinity_scale = 1.0 + math.log10(max(abs(V_total), 1.0))
+            _abs_V = abs(V_total)
+            _subfactors_list = [sf_Z, sf_A, sf_C, sf_E, sf_Q, sf_U, sf_D, sf_T, sf_R, sf_P, sf_B]
+            for _di in range(STRING_DIMENSIONS):
+                # Each dimension gets a fractal slice: V_total mod (fractal_base * (d+1))
+                _dim_period = _STRING_FRACTAL_BASE * (_di + 1)
+                _dim_frac = (_abs_V % _dim_period) / max(_dim_period, 1e-20)
+                # Amplitude: subfactor contribution scaled by fractal fraction
+                _sf_val = abs(_subfactors_list[_di]) if _di < len(_subfactors_list) else _abs_V
+                _dim11_amplitudes[_di] = min(1.0, _dim_frac * (0.3 + 0.7 * min(_sf_val / max(_abs_V, 1e-20), 1.0)))
+                # Phase: golden-ratio-spaced rotation driven by time and V_total
+                _dim11_phases[_di] = (simulation_time * (0.1 + 0.05 * _di) + _dim_frac * math.pi * 2.0 * (_di + 1) / STRING_DIMENSIONS) % (2.0 * math.pi)
+            # Format V% with appropriate precision based on magnitude
+            if V_total_percent < 0.001:
+                _vpct_str = f"{V_total_percent:.6e}%"
+            elif V_total_percent < 1.0:
+                _vpct_str = f"{V_total_percent:.6f}%"
+            elif V_total_percent > 1000:
+                _vpct_str = f"{V_total_percent:.2e}%"
+            else:
+                _vpct_str = f"{V_total_percent:.4f}%"
+            v_total_label.text = f"V_total: {V_total:.2e}  ({_vpct_str})  M={total_mass:.2e}  Chg={total_charge:.2e}"
+            v_subfactors_label.text = f"E={E_energy:.2e}  R={sf_R:.0f}  Q={sf_Q:.0f}  T={sf_T:.2e}  Z={sf_Z:.1f}  A={sf_A:.0f}  Rec={_recursive:.2f}"
+            # Update V_total percentage slider fill (logarithmic scale for wide range)
+            if V_total_percent > 0:
+                _log_pct = math.log10(V_total_percent + 1) / math.log10(INFINITY_MAP + 1)
+                vtotal_slider_fill.width = min(_log_pct, 1.0) * vtotal_slider_width
+            else:
+                vtotal_slider_fill.width = 0
+            vtotal_pct_label.text = f"V%: {_vpct_str}"
+            # Save dimensional sphere snapshot and/or deterministic frame for time travel
+            # Share _record_particle_states result if both trigger in the same frame (expensive deep copy)
+            _frame_states = None
+            _need_sphere = not sphere_nav_frozen and not _replay_active
+            _need_det = not _replay_active and not _perf.skip_det_frames and (frame_count % _perf.det_record_interval == 0)
+            if _need_sphere:
+                _sphere_snap_counter += 1
+                if _sphere_snap_counter >= _perf.sphere_snap_interval:
+                    _sphere_snap_counter = 0
+                    _frame_states = _record_particle_states(particles)
+                    _sphere_snapshots.append((simulation_time, V_total, V_total_percent, _frame_states))
+                    if len(_sphere_snapshots) > _sphere_snap_max:
+                        _sphere_snapshots.pop(0)
+            if _need_det:
+                if _frame_states is None:
+                    _frame_states = _record_particle_states(particles)
+                _det_frames.append((
+                    simulation_time, expansion_scale, cloud_radius, V_total, V_total_percent,
+                    _frame_states
+                ))
+                if len(_det_frames) > _det_frame_max:
+                    _det_frames.pop(0)
+            # Fill bar: center=0, right=positive, left=negative
+            _half_w = slider_width // 2
+            _tf_vis = min(abs(time_factor) / max_time_factor, 1.0)  # visual fraction (capped at bar edge)
+            if time_factor > 0:
+                fill_bar.x = slider_x + _half_w
+                fill_bar.width = int(_tf_vis * _half_w)
+                fill_bar.color = _TH_BAR_FILL
+            elif time_factor < 0:
+                _neg_w = int(_tf_vis * _half_w)
+                fill_bar.x = slider_x + _half_w - _neg_w
+                fill_bar.width = _neg_w
+                fill_bar.color = (200, 100, 80, 255)  # Red for reverse
+            else:
+                fill_bar.x = slider_x + _half_w - 1
+                fill_bar.width = 2
+                fill_bar.color = (120, 120, 120, 255)  # Gray for paused
+            total_particle_label.text = f"Total Particles: {n_independent + n_sub}"
+            total_independent_label.text = f"Independent: {n_independent}"
+            total_atom_label.text = f"Atoms: {n_atoms}"
+            frame_count += 1
+            current_time = time.time()
+            if current_time - last_fps_time >= 1.0:
+                current_fps = frame_count / (current_time - last_fps_time)
+                frame_count = 0
+                last_fps_time = current_time
+            _q_names = ['SURV', 'LOW', 'MED', 'HIGH', 'ULTRA']
+            _q_tag = _q_names[min(_perf.quality, 4)]
+            _gpu_tag = ' GPU' if _perf.use_gpu_gravity else ''
+            fps_label.text = f"FPS: {current_fps:.1f} [{_q_tag}{_gpu_tag}]"
+            if _diag_frame_num <= 3: _diag_file.write(f"frame#{_diag_frame_num} CP7-pre-nanotech\n"); _diag_file.flush()
+        # Update nanotech entities (alive AND dead â€” dead ones drift and decompose)
+            # Respect pause: motor rotation, thrust, ion dynamics all freeze when paused
+            if not paused:
+                for _nt in nanotech_loaded:
+                    _nt.update(dt, particles)
+            # Matter persists: dead entities remain as inert matter with residual energy/motion
+            # They are NEVER removed â€” only their physics state changes (no despawn)
+            # Process deferred observer window spawns (avoids pyglet Set iteration crash)
+            for _pending_target in _pending_observer_spawns:
+                try:
+                    _obs = ObserverWindow(target_particle=_pending_target)
+                    _observer_windows.append(_obs)
+                except Exception as _owe:
+                    print(f"Failed to create observer window: {_owe}")
+            _pending_observer_spawns.clear()
+            # Invalidate observer windows so they redraw each frame
+            for _ow in _observer_windows:
+                if _ow._alive:
+                    try:
+                        _ow._win.invalid = True
+                    except Exception:
+                        pass
+        if _diag_frame_num <= 3: _diag_file.write(f"frame#{_diag_frame_num} CP8-pre-shadow\n"); _diag_file.flush()
+        # Per-frame shadow body animation tick (smooth rendering independent of observer update rate)
+        # NOTE: anim_time, talk_timer, breath_phase, aura_pulse_phase, walk_phase, life_aura_phase
+        # are already incremented inside ShadowBody.update() â€” only update supplemental fields here
+        if _shadow_bodies:
+            for _sbf in _shadow_bodies:
+                # Smooth pose blending between frames
+                if _sbf._blend_t < 1.0:
+                    _sbf._blend_t = min(1.0, _sbf._blend_t + dt * _sbf._blend_speed)
+                    _sbf._current_pose = _lerp_pose(_sbf._current_pose, _sbf._target_pose,
+                                                      min(1.0, dt * _sbf._blend_speed * 2))
+                if _sbf.teleport_alpha < 1.0:
+                    _sbf.teleport_alpha = min(1.0, _sbf.teleport_alpha + dt * 2.0)
 
-    # === ALWAYS update time display (even when frozen/paused) ===
-    # This ensures F7 timeline clicks and key 3 time jumps reflect immediately.
-    _t_abs = abs(simulation_time)
-    _t_sgn = "-" if simulation_time < 0 else ""
-    _t_hrs = int(_t_abs // 3600)
-    _t_min = int((_t_abs % 3600) // 60)
-    _t_sec = int(_t_abs % 60)
-    _t_tags = []
-    if _det_playhead >= 0:
-        _t_tags.append(f"REPLAY {_det_playhead}/{len(_det_frames)}")
-    if _reverse_live_mode:
-        _t_tags.append("REVERSE LIVE")
-    if sphere_nav_frozen:
-        _t_tags.append("FROZEN")
-    _t_tag_str = (" | " + " | ".join(_t_tags)) if _t_tags else ""
-    simulation_label.text = f"T: {_t_sgn}{_t_hrs:02d}h:{_t_min:02d}m:{_t_sec:02d}s | Particles: {len(particles)}{_t_tag_str}"
+        # === ALWAYS update time display (even when frozen/paused) ===
+        # This ensures F7 timeline clicks and key 3 time jumps reflect immediately.
+        _t_abs = abs(simulation_time)
+        _t_sgn = "-" if simulation_time < 0 else ""
+        _t_hrs = int(_t_abs // 3600)
+        _t_min = int((_t_abs % 3600) // 60)
+        _t_sec = int(_t_abs % 60)
+        _t_tags = []
+        if _det_playhead >= 0:
+            _t_tags.append(f"REPLAY {_det_playhead}/{len(_det_frames)}")
+        if _reverse_live_mode:
+            _t_tags.append("REVERSE LIVE")
+        if sphere_nav_frozen:
+            _t_tags.append("FROZEN")
+        _t_tag_str = (" | " + " | ".join(_t_tags)) if _t_tags else ""
+        simulation_label.text = f"T: {_t_sgn}{_t_hrs:02d}h:{_t_min:02d}m:{_t_sec:02d}s | Particles: {len(particles)}{_t_tag_str}"
+        _upd_elapsed = time.perf_counter() - _upd_t0
+        if _diag_frame_num <= 3:
+            _diag_file.write(f"frame#{_diag_frame_num} END ok elapsed={_upd_elapsed*1000:.1f}ms\n")
+            _diag_file.flush()
+        if _upd_elapsed > 0.1:
+            print(f"[DIAG] update() took {_upd_elapsed*1000:.0f}ms (frame {frame_count})")
+    except Exception as _diag_exc:
+        import traceback
+        _diag_file.write(f"frame#{_diag_frame_num} EXCEPTION: {_diag_exc}\n")
+        _diag_file.write(traceback.format_exc() + "\n")
+        _diag_file.flush()
 
 # On draw
 @window.event
@@ -45897,6 +46142,7 @@ def on_draw():
     global current_fps, particle_list_offset, cluster_list_offset, atom_list_offset, positron_list_offset, input_number, _nanotech_focus_scroll, _molecule_focus_scroll, _f1_scroll_offset, _f1_scroll_max, _mandelbrot_3d_cache, _mandelbrot_3d_cache_key, _mandelbrot_2d_cache, _mandelbrot_2d_cache_key, _mandelbrot_cache, _mandelbrot_cache_key, _f1_page, _pause_start_time, _afk_auto_unpause, _afk_enabled, paused, _ai_dashboard_scroll, _mb_vbo_key
     if WIDTH < 10 or HEIGHT < 10:
         return
+    _draw_t0 = time.perf_counter()
     try:
         window.switch_to()  # Restore GL context after observer windows
     except Exception:
@@ -49576,7 +49822,7 @@ def on_draw():
             _op_lines.append('')
             _op_lines.append('--- AI Chat ---')
             for _ct, _cs, _cr, _cm in list(_obs_chat_log)[-8:]:
-                _op_lines.append(f'  {_cs} -> {_cr}: {_cm[:55]}')
+                _op_lines.append(f'  {_cs} -> {_cr}: {_cm}')
         # Shadow body status
         if _shadow_bodies:
             _op_lines.append('')
@@ -49735,7 +49981,7 @@ def on_draw():
                 for _ct, _cs, _cr, _cm in list(_obs_chat_log)[-8:]:
                     _age = time.time() - _ct
                     _age_str = f'{_age:.0f}s' if _age < 60 else f'{_age/60:.0f}m'
-                    _ai_lines.append(f'  [{_age_str}] {_cs}->{_cr}: {_cm[:55]}')
+                    _ai_lines.append(f'  [{_age_str}] {_cs}->{_cr}: {_cm}')
         # ── TAB 2: INTELLIGENCE GAUGE ──
         elif _ai_dashboard_tab == 2:
             _ai_lines.append('=== Intelligence Assessment ===')
@@ -51307,6 +51553,10 @@ def on_draw():
         popup_prompt.draw()
         popup_input.text = input_number
         popup_input.draw()
+
+    _draw_elapsed = time.perf_counter() - _draw_t0
+    if _draw_elapsed > 0.1:
+        print(f"[DIAG] on_draw() took {_draw_elapsed*1000:.0f}ms")
 
 
 # Intercept window close to show exit confirmation

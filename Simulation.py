@@ -57654,7 +57654,7 @@ def update(dt):
 # On draw
 @window.event
 def on_draw():
-    global current_fps, particle_list_offset, cluster_list_offset, atom_list_offset, positron_list_offset, input_number, _nanotech_focus_scroll, _molecule_focus_scroll, _f1_scroll_offset, _f1_scroll_max, _mandelbrot_3d_cache, _mandelbrot_3d_cache_key, _mandelbrot_2d_cache, _mandelbrot_2d_cache_key, _mandelbrot_cache, _mandelbrot_cache_key, _f1_page, _pause_start_time, _afk_auto_unpause, _afk_enabled, paused, _ai_dashboard_scroll, _mb_vbo_key
+    global current_fps, particle_list_offset, cluster_list_offset, atom_list_offset, positron_list_offset, input_number, _nanotech_focus_scroll, _molecule_focus_scroll, _lifeform_focus_scroll, _f1_scroll_offset, _f1_scroll_max, _mandelbrot_3d_cache, _mandelbrot_3d_cache_key, _mandelbrot_2d_cache, _mandelbrot_2d_cache_key, _mandelbrot_cache, _mandelbrot_cache_key, _f1_page, _pause_start_time, _afk_auto_unpause, _afk_enabled, paused, _ai_dashboard_scroll, _mb_vbo_key
     if WIDTH < 10 or HEIGHT < 10:
         return
     try:

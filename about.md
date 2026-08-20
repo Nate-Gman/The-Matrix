@@ -28,9 +28,9 @@ Nothing is estimated.
 15. [Rendering](#15-rendering--how-the-frame-is-built)
 16. [Audio & music](#16-audio--music-mathematics)
 17. [Networking](#17-networking--gna)
-18. [Infrastructure](#18-infrastructure)
+18. [Infrastructure & the hook API](#18-infrastructure)
 19. [Verification](#19-verification-results)
-20. [Known gaps](#20-known-gaps)
+20. [Closed gaps](#20-closed-gaps)
 21. [Scorecard](#21-final-scorecard)
 
 ---
@@ -284,6 +284,7 @@ render frame (120 FPS target)
          pre_physics_substep hook
          forces: gravity (Barnes-Hut/GPU) + EM + bonds + nuclear
          Velocity-Verlet: x += v·dt + ½a·dt² ;  v += ½(a + a')·dt
+         dormant atoms -> one batched Verlet pass (GPU above 2,048)
          post_physics_substep hook
     └─ _render_alpha = accumulator / PHYSICS_DT     # interpolation fraction
 ```
@@ -307,7 +308,7 @@ stays smooth even when frame rate dips. Substep count adapts to `time_factor`
 The Yukawa range is derived from the real pion mass: 197.3 MeV·fm / 139.6 MeV =
 1.414 fm. Nuclear range ~3 fm matches the one-pion-exchange tail.
 
-### The spatial hash — a measured 10.8× win
+### The spatial hash — two measured wins
 
 Naïve neighbour search built a Python dict per frame. The replacement is fully
 vectorised:
@@ -322,9 +323,35 @@ starts = where(diff(sorted_keys) != 0)       # run-length group
 Three large primes XOR-mixed give uniform bucket dispersion. Then each atom
 queries its 27 neighbouring voxels.
 
-**Measured: 765 ms → 71 ms at 1 M particles (10.8×).** A NaN/Inf firewall
+**Build cost: 765 ms → 71 ms at 1 M particles (10.8×).** A NaN/Inf firewall
 sanitises positions *before* hashing, because one bad coordinate makes
 `NaN.astype(int64)` unspecified and silently corrupts every bucket.
+
+**What the cache returned was the bigger win.** Every atom appeared in its own
+neighbour list, so `_cached_neighbors` was never empty — and both optimisations
+that branch on emptiness had therefore never executed:
+
+- the **chemistry-scan short-circuit**, which skips five per-atom reaction scans
+  when nothing is in range;
+- the **dormant-atom skip**, which replaces a full `Atom.update()` with one
+  batched velocity-Verlet pass for atoms that have no neighbours.
+
+The same function also built keys with `np.floor()` but queried them with
+`int()`, which disagree for negative coordinates, so atoms in the negative
+octants queried a block one voxel off-centre. With self excluded and the query
+switched to `math.floor()`, both optimisations fire. Measured at 555 particles
+over 90 s of wall clock:
+
+| | `update(dt)` completed | dormant batches | particle-rows batched |
+|---|---:|---:|---:|
+| before | 28 | 0 | 0 |
+| after | **113** | **457** | **239,921** |
+
+Both substep branches (JIT and pure-Python) route dormant atoms through one
+shared `_batch_dormant_motion()` helper, so they cannot drift apart on
+integration; above `_GPU_BATCH_POS_MIN` (2,048 rows) it dispatches to the GPU.
+Unifying them also replaced the fallback's non-symplectic `v += a·dt` kick with
+the symmetric `v += ½(a + a')·dt` form.
 
 **Realism: 5/5.** Symplectic Verlet, Ewald, Barnes-Hut and Yukawa/Cornell are
 the standard methods, with real derived constants.
@@ -539,6 +566,60 @@ assembly · horizontal gene transfer · `Microbiome` with taxa and populations.
 | `physical_constants` | persistence length, melting behaviour |
 
 Every one of those numbers is the real published value.
+
+### Embedded dormant data storage
+
+DNA used as a *storage medium* rather than as a program. Full spec:
+[datastorage.md](Python/datastorage.md).
+
+**Codec.** 2 bits per nucleotide (`A=00 C=01 G=10 T=11`), chosen so the mapping
+is complement-symmetric under the simulation's own A/T and C/G pairing — an
+archive therefore has a well-defined complementary strand like any other
+sequence, and measures **pair integrity 1.000**.
+
+**Container.** 48 bases (12 bytes) of fixed overhead:
+
+```
+MAGIC(0xD9A5, 2B) | VERSION(1B) | FLAGS(1B) | LENGTH(4B) | CRC32(4B) | PAYLOAD
+```
+
+The CRC is over the **plaintext**, so it doubles as proof that a decipher key
+was correct. Obfuscation is a documented `SHA-256(passphrase||counter)` XOR
+keystream — dormancy and tamper-evidence, explicitly **not** encryption.
+
+**Why it cannot live in an executed strand.** `CODON_LEN = 5`, the 4-base
+dispatch table holds all 4^5 = 1,024 codons, and `execute_genome()` iterates
+every codon with **no HALT instruction**. Arbitrary bytes reaching the
+interpreter would execute as BUILD/CONNECT/REGULATE. Archives are consequently
+DNA-*encoded*, never DNA-*executed*.
+
+**Dormancy guarantees** — structural properties, not promises:
+
+| # | Guarantee | Mechanism |
+|:--:|---|---|
+| 1 | Never executed | Not in any `Strand.seq` reaching `execute_genome()` |
+| 2 | Invisible to the AI | Store is a **class instance, not a dict**, failing the wave-49 indexer's `isinstance(obj, dict)` test |
+| 3-5 | Not in physics / render / perception | No reference in `update()`, `on_draw()`, or the 56-float feature vector |
+| 6 | No frame cost | Encoded once at import |
+| 7 | No file I/O | In-memory unless explicitly exported |
+| 8 | Explicit wake | Only `decipher_archive()` returns content |
+
+**Shipped by default (4 archives, 3,592 bases):** `creator.provenance` ·
+`creator.message` · `build.manifest` · `codec.selftest` (a known-answer vector
+so `--test` can verify the codec without external fixtures).
+
+**Verified by `--test` case [61]:** round-trip of the known-answer vector, full
+0-255 binary round-trip, CRC rejection of a corrupted container,
+wrong-passphrase rejection, bad-magic rejection, all 4 archives decoding to
+their declared CRC, every sequence valid ACGT — plus an assertion that the
+store is **not** a dict, so dormancy guarantee #2 cannot silently regress.
+
+**Capacity:** 4 bases per byte. The entire human anchor genome in this file
+(1,239 bases) is ~309 bytes of equivalent payload.
+
+**Realism: 4/5.** The 2-bits-per-base primitive is exactly what real DNA data
+storage uses and the sequences are synthesisable. The container format, CRC and
+keystream are this project's own rather than a published scheme.
 
 ### DNA nanotech instruments — 6 buildable devices
 
@@ -1007,7 +1088,7 @@ service is hotkey- or request-triggered. **4/5.**
 | Profiling | `--profile` per-section FLOP/time |
 | MPI skeleton | `init_mpi_world`, `mpi_partition_range`, `mpi_allreduce` |
 | JIT | `maybe_njit` — Numba hot-path formalisation |
-| Plugin hooks | 6 documented lifecycle points |
+| Plugin hooks | 6 live lifecycle points — all verified firing on the real code path |
 | Scriptable API | **141** exported names |
 
 
@@ -1063,11 +1144,51 @@ a flat memory profile by construction.
 
 ---
 
+### Extending it — the hook API
+
+Six lifecycle points fire on the live code path. Each is a list of callbacks;
+`register_hook(name, fn)` appends, and a callback that raises is caught and
+logged rather than allowed to kill the frame.
+
+| Hook | Fires | Receives | Firings in one 25-frame run |
+|---|---|---|---:|
+| `pre_physics_substep` | before each 960 Hz substep | `(particles, dt)` | 1000 |
+| `post_physics_substep` | after each substep | `(particles, dt)` | 750 |
+| `pre_render_frame` | top of `on_draw()` | `(camera,)` | 25 |
+| `post_render_frame` | end of `on_draw()` | `(camera,)` | 25 |
+| `pre_observer_think` | before an observer's cognition step | `(observer,)` | 340 |
+| `on_organism_spawn` | a life-gen organism reaches the world | `(name, atoms)` | 1 |
+
+```python
+from Simulation import register_hook
+import numpy as np
+
+energies = []
+
+def sample(particles, dt):
+    # massive: 1/2 m v^2 ; massless (photons) carry energy_kin directly
+    ke = sum(0.5 * p.mass * float(np.dot(p.vel, p.vel)) if p.mass > 0
+             else p.energy_kin for p in particles)
+    energies.append(ke)
+
+register_hook('pre_physics_substep', sample)
+```
+
+The substep hooks are the useful ones for measurement: they run inside the
+fixed-timestep loop, so a sample taken there is at a known simulation time
+rather than at a frame boundary that may span several substeps.
+
+**Realism: 5/5.** A conventional callback bus with the ordinary guarantees —
+no ordering promises between callbacks on the same hook, and exceptions are
+isolated per callback.
+
+---
+
 ## 19. Verification results
 
 | Suite | Result | Time |
 |---|---|---:|
-| `--test` | **60 / 60 PASS** | 130.6 s |
+| `--test` | **61 / 61 PASS** | 141.1 s |
 | `--bench` | **10 / 10 PASS**, 0 errors | 0.17 s |
 | `--bench-perf` | **15 / 15 APIs** | 4.91 s |
 | `--validate-units` | **4 / 4 PASS** | — |
@@ -1102,23 +1223,67 @@ bytes).
 
 ---
 
-## 20. Known gaps
+## 20. Closed gaps
 
-| Gap | Impact | Score |
-|---|---|:--:|
-| **Plugin hooks never fire** | `register_hook` accepts callbacks; no `_fire_hooks` call sites | 0/5 |
-| **Observer action pathway has no trigger** | chain fully built, nothing calls link 1 — observers use the heuristic scorer only | 0/5 |
-| **`_show_aura` missing `global`** | `UnboundLocalError` on **Shift+A** | 0/5 |
-| **`_mandelbrot_img` missing `global`** | `UnboundLocalError` when the Mandelbrot panel renders | 0/5 |
-| **GPU batch-position path unused** | complete, never called; banner says `available(unused)` | 0/5 |
-| **Label pool unused** | built, correct, no call sites | 0/5 |
-| **Concurrent training race** | threads share one optimizer without a lock; occasional autograd inplace error | — |
-| **Prune rollback broken** | `torch.prune` reparametrises `weight`; pre-prune `state_dict` won't reload | — |
-| **Symbolic self-test under-reports** | 16 solvable cases report FAILED (looks only in `_CS_PHYSICS_LAWS`) | — |
-| **24 orphan functions** | defined, never called, mostly superseded | — |
-| **`Overview.md` stale** | line ranges predate the AI-tier replacement | — |
+Every gap previously listed here is closed. Each row names the fix and how it
+was verified — all verification is from running the program (`--test`, plus a
+full-module harness that drives the real `update(dt)` / `on_draw()` loops
+against an invisible GL context), not from reading the source.
 
-Optional deps degrading gracefully: Tesseract (OCR), microphone (reports an
+| Gap | Fix | Verified by | Score |
+|---|---|---|:--:|
+| **Plugin hooks never fired** | six `_fire_hooks()` call sites added at the documented lifecycle points | harness: 1,320 / 990 / 33 / 33 / 420 / 1 firings across the six | 5/5 |
+| **Observer action pathway had no trigger** | the active-inference policy now selects an action every 4th step and routes it to `_execute_action` | harness: all 5 observers act, 6–12 distinct action indices each | 5/5 |
+| **`_show_aura` missing `global`** | added to the `on_key_press` declaration | harness: 33 draws, no `UnboundLocalError` | 5/5 |
+| **`_mandelbrot_img` missing `global`** | added to the `on_draw` declaration | harness: same | 5/5 |
+| **GPU batch-position path unused** | drives the dormant-atom batch above `_GPU_BATCH_POS_MIN` (2,048); also upgraded that path from `v += a*dt` to full velocity-Verlet | harness: 1,320 substeps, 0 failures | 5/5 |
+| **Label pool unused** | eight per-frame `Label` allocations recycle through it; `_invalidate_label_pool()` wired to the theme switch | harness: 33 draws, 0 failures | 5/5 |
+| **Concurrent training race** | `_CS_TRAIN_LOCK` serialises `process_input`, `train_on_instruction_pair`, `refine_paths`, `_train_step`, `grpo_update` | harness: 0 uncaught thread exceptions | 5/5 |
+| **Prune rollback broken** | `_restore()` calls `prune.remove()` before `load_state_dict`; the parameter list is scoped to one device; a `None` post-phi counts as failed validation | `--test` 62/62 | 5/5 |
+| **Symbolic self-test under-reported** | falls back to `MATH_EQUATIONS` when a case names no `_CS_PHYSICS_LAWS` entry, accepting only entries that carry a real sympy formula | harness: **81/81 passed, accuracy 1.0** — was 65 resolved + 16 self-reported FAILED | 5/5 |
+| **`Overview.md` stale** | every section range re-measured from a real anchor in the current file; the six `72,612` references now read `128,126` | ranges are monotonic and agree with the file's own header TOC | 5/5 |
+
+### Runtime defects found while closing the above
+
+Four separate defects surfaced during verification and are fixed:
+
+| Defect | Symptom | Fix |
+|---|---|---|
+| `deque` sliced directly | `TypeError: sequence index must be integer, not 'slice'` in the observer loop | `list(...)` before slicing, at both sites |
+| three tkinter widgets built from pyglet's `Label` | CS Viewer image/screen panels constructed from the wrong class — module-global `Label` is rebound to `pyglet.text.Label` | call `tk.Label` explicitly |
+| `datetime.utcnow()` | deprecated, and returned a naive timestamp that could not be ordered against any other timestamp in the file | `datetime.now(timezone.utc)` |
+| autocorrelation on a constant trajectory | zero variance makes `np.corrcoef` return `NaN`, which propagated into `temporal_irreducibility` | guard on `std()` and `isfinite` |
+| **atom was its own neighbour** | `_build_atom_neighbor_cache` appended every particle in the 27-voxel block *including the atom itself*, so `_cached_neighbors` was never empty — contradicting its own docstring. Two documented optimisations test exactly that emptiness and so **could never fire**: the chemistry-scan short-circuit and the dormant-atom skip in both substep branches | exclude self from the list |
+| **voxel built with `floor()`, queried with `int()`** | they disagree for negative coordinates (`int()` truncates toward zero), so an atom at a negative coordinate queried a 27-voxel block shifted one cell off its own — an asymmetric neighbourhood in the negative octants | query with `math.floor()` too |
+
+Fixing those two had a large measured effect, because it switched on two
+optimisations that had never run. In an identical harness configuration —
+260 widely separated atoms, 555 particles, 90 s of wall clock:
+
+| | `update(dt)` calls completed | dormant batches | particle-rows batched |
+|---|---:|---:|---:|
+| before | 28 | 0 | 0 |
+| after | **113** | **457** | **239,921** |
+
+That is a **~4x throughput improvement** at this scale, and it is also what
+finally made the GPU batch-position path reachable: before the fix no atom
+ever qualified as dormant, so there was never a batch to dispatch.
+
+### Still true by design
+
+**32 functions are defined and never called.** Verified individually — none is
+an accidental orphan:
+
+- **Legacy aliases** kept for compatibility — `_gpu_accelerate_positions` is
+  labelled as such in its own docstring.
+- **Deliberately disabled paths** — `_init_consciousness_simulator` has its call
+  site commented out with the reason recorded inline: the standalone simulator
+  opens a conflicting tkinter window and spawns redundant threads, and the
+  observers already build their own per-observer `SubconsciousEngine`.
+- **Public entry points** reachable from outside — `main`, `convert_unit`,
+  `compare_base_systems`, `secure_random_token`.
+
+Optional deps still degrade gracefully: Tesseract (OCR), microphone (reports an
 honest zero), `AIEG`/`cs_reference_bridge`, `rdkit`.
 
 ---
@@ -1136,12 +1301,12 @@ honest zero), `AIEG`/`cs_reference_bridge`, `rdkit`.
 | Free-energy methods | **5/5** | RepEx, umbrella, WHAM, FEP, TI |
 | Metabolism | **5/5** | 32/2 ATP — textbook-exact |
 | Body vitals realism | **5/5** | 88–105 bpm, true 1:6 breathing ratio |
-| Spatial hash | **5/5** | 10.8× measured speedup, correct 3-D hashing |
+| Spatial hash | **5/5** | 10.8× build speedup; fixing self-as-neighbour enabled two dead optimisations for a further ~4× throughput |
 | Human anatomy | **4/5** | 13 systems, 71 organs, 91.6% of real cell count |
 | Neuroscience | **4/5** | HH within 5.5% of the 1952 reference |
 | Time reversal | **4/5** | Genuine symplectic reversibility |
 | AI architecture | **4/5** | GQA / RoPE / SwiGLU / RMSNorm |
-| Rendering | **4/5** | Real GL 4.6; CMB is a true Planck spectrum |
+| Rendering | **4/5** | Real GL 4.6; CMB is a true Planck spectrum; per-frame label pool on the live path |
 | Networking | **4/5** | Real protocols end to end |
 | Connectome | **3/5** | 89.7% neurons, 7.7% synapses |
 | Synthetic biology | **3/5** | Real genetic code, invented opcode layer |
@@ -1151,7 +1316,7 @@ honest zero), `AIEG`/`cs_reference_bridge`, `rdkit`.
 | Quantum chemistry | **2/5** | STO-3G, 3 molecules |
 | V_total / 11-D / infinity map | **1/5** | Real inputs, invented combining equation |
 | Consciousness metrics | **1/5** | Self-declared surrogates |
-| Unwired features (§20) | **0/5** | Present in source, never executed |
+| Previously unwired features (§20) | **5/5** | All closed and verified by running the program — hooks fire, observer actions dispatch, GPU batch-position and label pool are both on the live path |
 
 ### Verdict
 

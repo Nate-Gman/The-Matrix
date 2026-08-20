@@ -25,6 +25,7 @@ mechanism and realism scoring.
 8. [AI & machine-learning research](#8-ai--machine-learning-research)
 9. [AI safety & alignment](#9-ai-safety--alignment-research)
 10. [Systems & software engineering](#10-systems--software-engineering)
+10b. [Instrumenting & driving it from outside](#10b-instrumenting-and-driving-the-simulation-from-outside)
 11. [Data, art & science communication](#11-data-art--science-communication)
 12. [The speculative end — "furthering realities"](#12-the-speculative-end--furthering-realities)
 13. [Complete use index](#13-complete-use-index)
@@ -57,9 +58,10 @@ address space, sharing one clock**:
 neuron and a reasoning agent in the same running process and let them interact.
 No mainstream tool spans quarks → cognition in one file.
 
-Add: **141 exported API names**, a plugin hook system, deterministic seeding,
-and export to every mainstream MD format — so anything you observe here can be
-moved into GROMACS, VMD, PyMOL or a Jupyter notebook.
+Add: **141 exported API names**, a **six-point hook API that fires on the live
+code path**, deterministic seeding, and export to every mainstream MD format —
+so anything you observe here can be instrumented in place, then moved into
+GROMACS, VMD, PyMOL or a Jupyter notebook.
 
 ---
 
@@ -321,7 +323,36 @@ from Simulation import (wright_fisher_step, moran_step, mutate_seq_realistic,
 Wright-Fisher vs Moran on identical populations; realistic mutation spectra;
 flux-balance analysis of metabolic networks.
 
-### 6.4 Sequence work
+### 6.4 DNA data storage research
+
+The dormant-archive codec is a working 2-bits-per-base encoder with container,
+CRC and error detection — the same primitive as Church 2012 / Goldman 2013 /
+Erlich 2017.
+
+```python
+from Simulation import (encode_to_nucleotides, decode_from_nucleotides,
+                        embed_archive, decipher_archive, archive_to_strand)
+
+seq = encode_to_nucleotides(open('paper.pdf', 'rb').read())
+print(len(seq), 'bases')              # 4 bases per byte + 48 overhead
+strand = archive_to_strand('codec.selftest')
+print(strand.pair_integrity())        # 1.000 - synthesisable sequence
+```
+
+Study designs this supports:
+
+- **Encoding density comparisons** — 2 bits/base against ternary or
+  DNA-Fountain schemes on the same corpus.
+- **Error-tolerance experiments** — mutate an archive with `Strand.replicate()`,
+  which applies the base system's *real* error rate, and measure how many
+  generations survive CRC. This couples the storage codec to the simulation's
+  actual replication-error model — a genuinely interesting experiment needing no
+  external tooling.
+- **Base-system tradeoffs** — 2/4/6/8-base systems are all supported; a 6-base
+  genome carries ~2.58 bits/base. Compare capacity against error rate.
+- **Provenance / watermarking** — embedding authorship in synthesised constructs.
+
+### 6.5 Sequence work
 
 ```python
 from Simulation import (parse_fasta, write_fasta, total_charge_for_sequence,
@@ -330,7 +361,7 @@ from Simulation import (parse_fasta, write_fasta, total_charge_for_sequence,
 
 Plus the 10 validated human reference genes as a clean test corpus.
 
-### 6.5 Human physiology modelling
+### 6.6 Human physiology modelling
 
 The 13-system body constructor at selectable resolution (atomic → molecular →
 organelle → cellular → tissue → organ), totalling 3.39 × 10¹³ cells at 91.6% of
@@ -461,9 +492,14 @@ simulation.
   navigable section TOC, a curated 141-name public API, and an explicit
   honesty convention. Whatever you conclude about the approach, it is a real
   data point.
-- **Performance engineering** — a documented 10.8× win (765 ms → 71 ms at 1 M
-  particles) from replacing a Python dict loop with a vectorised
-  argsort/run-length spatial hash. A clean before/after worth teaching.
+- **Performance engineering** — two documented wins from one subsystem. First a
+  10.8× build speedup (765 ms → 71 ms at 1 M particles) from replacing a Python
+  dict loop with a vectorised argsort/run-length spatial hash. Then a further
+  **~4× throughput** (28 → 113 `update(dt)` calls in a fixed 90 s) from noticing
+  the cache listed every atom as its own neighbour — which meant two
+  optimisations that branch on "no neighbours" had never once executed. A clean
+  before/after, and a good lesson that a fast data structure can still return
+  an answer that defeats the code reading it.
 - **Adaptive degradation** — the performance governor drops quality 3→0 under
   load, observed live keeping a window responsive while five transformers
   initialised.
@@ -475,6 +511,70 @@ simulation.
 - **Threading discipline** — deliberate rate mismatches (4 Hz / 7 Hz / 0.1 Hz)
   with the reasoning documented inline.
 - **GPU fallback patterns** — every CUDA path has a CPU equivalent.
+
+---
+
+## 10b. Instrumenting and driving the simulation from outside
+
+These three capabilities are on the live code path, verified by running the
+program. They are what make the rest of this document practical rather than
+aspirational, because they are how you get data *out* and behaviour *in*.
+
+### 10b.1 Measure anything, without forking the file
+
+`register_hook` attaches your code to six lifecycle points. The substep hooks
+run **inside** the fixed 960 Hz loop, so samples land at a known simulation
+time instead of at a frame boundary that may span several substeps — the
+difference between a usable time series and a jittery one.
+
+```python
+from Simulation import register_hook
+import numpy as np
+
+series = []
+
+def probe(particles, dt):
+    # massive: 1/2 m v^2 ; massless (photons) carry energy_kin directly
+    ke = sum(0.5 * p.mass * float(np.dot(p.vel, p.vel)) if p.mass > 0
+             else p.energy_kin for p in particles)
+    series.append(ke)
+
+register_hook('pre_physics_substep', probe)
+```
+
+Good for: conservation audits on your own schedule, custom order parameters,
+streaming to an external logger or notebook, recording an agent's view of the
+world at every cognition step (`pre_observer_think`), or reacting when life-gen
+puts an organism into the world (`on_organism_spawn`).
+
+### 10b.2 Agents that change the world, not just watch it
+
+Each of the five observers runs a 12.6 M-parameter `SubconsciousEngine`, and
+its active-inference policy dispatches an action into the simulation every
+fourth cognition step — spawning atoms, refocusing, altering the time factor.
+A typical run shows 26–33 dispatches per observer across 9–12 distinct actions.
+
+This is what makes the embodied-agent work in §2.1 and §8 a genuine
+**closed loop**: the agent perceives a 56-float world vector, acts, and its
+next perception reflects the consequence. Without dispatch it would only ever
+be a perception benchmark.
+
+Good for: intrinsic-motivation studies where curiosity must actually change
+the environment, multi-agent interference experiments (five agents, one shared
+world), and action-selection ablations — swap the policy and measure the
+behavioural difference against a fixed world.
+
+### 10b.3 Sparse scenes run about 4× faster
+
+Atoms with no neighbours are recognised as dormant and moved by a single
+batched velocity-Verlet pass rather than a full per-atom update, with the batch
+dispatched to the GPU above 2,048 rows. In a fixed 90 s budget at 555
+particles, completed `update(dt)` calls went from 28 to 113.
+
+The size of that win depends on how *sparse* your scene is — it is large for
+diffuse gases, dilute solutions, debris fields and early-universe scenarios,
+and small for a dense condensed-phase box where few atoms are ever isolated.
+Worth knowing which regime you are in before quoting a number.
 
 ---
 
@@ -491,8 +591,10 @@ simulation.
   agents, with time reversal for "watch that again".
 - **Screenshots and figures** — `save_screenshot()`, plus WebGL JSON export for
   interactive web figures.
-- **Live-coding demos** — the plugin hook API lets you attach behaviour to a
-  running simulation without restarting it.
+- **Live-coding demos** — the hook API attaches behaviour to a running
+  simulation without restarting it, and the substep hooks fire inside the
+  fixed-timestep loop, so a demo can sample at a known simulation time rather
+  than at an arbitrary frame boundary.
 
 ---
 
@@ -574,6 +676,8 @@ positive one.
 | 13 | Plasticity rule comparison | Neuroscience | ★★★ |
 | 14 | AI safety invariant study | Safety | ★★★ |
 | 15 | Honest-metric-reporting pattern | Safety | ★★★ |
+| 15b | In-process instrumentation via the hook API | Engineering | ★★★ |
+| 15c | Closed-loop agent action experiments | AI | ★★★ |
 | 16 | Synthetic biology / genome design | Biology | ★★ |
 | 17 | Population genetics | Biology | ★★ |
 | 18 | Connectomics + 3-D visualisation | Neuroscience | ★★ |
@@ -603,6 +707,8 @@ positive one.
 | 42 | Microbiome dynamics | Biology | ★ |
 | 43 | Self-assembly studies | Physics | ★ |
 | 44 | Sequence analysis (FASTA) | Biology | ★ |
+| 46 | DNA data-storage codec research | Biology | ★★ |
+| 47 | Replication-error tolerance of stored data | Biology | ★★ |
 | 45 | HPC / MPI teaching skeleton | Engineering | ★ |
 
 ★★★ = the code strongly supports it today · ★★ = supported, some assembly ·
@@ -627,11 +733,18 @@ Stated plainly so nobody builds on a false premise.
 | **Replace a physics engine for games** | It optimises for correctness and instrumentation, not throughput. |
 | **Run headless without care** | The full app expects a GL context; use `--test`/`--bench`/`--cs-viewer` or `CS_HEADLESS=1`. |
 
-**Known gaps that affect use** (detail in [about.md §20](about.md)): the plugin
-hooks currently never fire, the observer action pathway has no trigger, and
-`Shift+A` and the Mandelbrot panel raise `UnboundLocalError`. If your use
-depends on hooks or on AI-driven observer actions, those need reconnecting
-first.
+**Gaps that used to affect use are closed** (detail and evidence in
+[about.md §20](about.md)). The plugin hooks now fire at all six lifecycle
+points, the observer action pathway is driven by the active-inference policy on
+every observer, and `Shift+A` and the Mandelbrot panel no longer raise
+`UnboundLocalError`. So the two capabilities most likely to gate a project —
+**hooking the simulation from your own code** and **AI-driven observer
+actions** — both work as documented, with no reconnecting required.
+
+What still limits use is the table above, not defects: this is a
+research/instrumentation instrument, not a QFT solver, not a game engine, and
+its V_total is an internal complexity index rather than an externally
+checkable physical quantity.
 
 ---
 
@@ -641,7 +754,7 @@ first.
 
 ```bash
 python Python/Simulation.py --validate-units   # 4 constants vs published
-python Python/Simulation.py --test             # 60-test suite
+python Python/Simulation.py --test             # 61-test suite
 python Python/Simulation.py --bench            # 10 benchmarks vs literature
 ```
 

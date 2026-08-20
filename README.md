@@ -8,7 +8,7 @@ and a peer-to-peer network stack. All in one Python file.
 | | |
 |---|---|
 | **Entry point** | [`Python/Simulation.py`](Python/Simulation.py) |
-| **Size** | 127,362 lines · 7.52 MB · 523 classes · 3,601 functions |
+| **Size** | 128,126 lines · 7.21 MB · 524 classes · 3,629 functions |
 | **Version** | `0.4.0-dev` · 141 exported API names |
 | **Platform** | Windows (built on Win 11 + RTX 5070 Ti); CPU fallback throughout |
 
@@ -44,7 +44,7 @@ PyTorch auto-installs CUDA 12.8 → 12.4 → CPU.
 | Flag | Purpose |
 |---|---|
 | *(none)* | Full simulation |
-| `--test` | 60-test validation suite → JSON verdict |
+| `--test` | 61-test validation suite → JSON verdict |
 | `--bench` | 10 benchmarks vs published reference values |
 | `--bench-perf` | 15-API micro-benchmark table |
 | `--validate-units` | Derives 4 physical results from the constants |
@@ -54,7 +54,7 @@ PyTorch auto-installs CUDA 12.8 → 12.4 → CPU.
 | `--seed N` | Deterministic RNG |
 
 ```
---test  60/60 PASS   --bench  10/10 PASS   --bench-perf  15/15   --validate-units  4/4
+--test  61/61 PASS   --bench  10/10 PASS   --bench-perf  15/15   --validate-units  4/4
 ```
 
 ---
@@ -132,11 +132,22 @@ motion stays smooth at any frame rate.
 | Nuclear | Yukawa, λ = ℏc/m_πc² = **1.414 fm** (from the real pion mass) |
 | Confinement | Cornell potential, α_s = 0.3, σ = 0.18 GeV/fm |
 
-**The spatial hash — a measured 10.8× win.** Voxel keys are XOR-mixed from
-three large primes, sorted with `argsort`, run-length grouped, then each atom
-queries 27 neighbouring cells. **765 ms → 71 ms at 1 M particles.** A NaN/Inf
-firewall sanitises positions *before* hashing, because one bad coordinate makes
-`NaN.astype(int64)` unspecified and silently corrupts every bucket.
+**The spatial hash — two measured wins.** Voxel keys are XOR-mixed from three
+large primes, sorted with `argsort`, run-length grouped, then each atom queries
+27 neighbouring cells. Building it went **765 ms → 71 ms at 1 M particles
+(10.8×)**. A NaN/Inf firewall sanitises positions *before* hashing, because one
+bad coordinate makes `NaN.astype(int64)` unspecified and silently corrupts every
+bucket.
+
+The second win came from fixing what the cache *returned*. It listed each atom as
+its own neighbour, so `_cached_neighbors` was never empty — and the two
+optimisations that test for emptiness had therefore never run: the chemistry-scan
+short-circuit and the dormant-atom skip. With self excluded (and the voxel query
+switched to `math.floor()` to match how the keys are built), an isolated atom is
+recognised as dormant and moved by one batched velocity-Verlet pass instead of a
+full `Atom.update()`. Measured at 555 particles over 90 s: **28 → 113 completed
+`update(dt)` calls, roughly 4×**, with 457 dormant batches covering 239,921
+particle-rows. Above 2,048 rows that batch is dispatched to the GPU.
 
 Also: orthorhombic + triclinic PBC · NVE/NVT/NPT · SHAKE/RATTLE · relativistic
 Lorentz factor, Doppler and gravitational redshift · per-frame conservation
@@ -213,6 +224,41 @@ promoter boxes −35 **TTGACA** and −10 Pribnow **TATAAT**. Plus **6 buildable
 nanotech instruments** (origami tile ~100 × 70 nm needing 7,200 nucleotides,
 drug-delivery box, molecular ruler, AND logic gate, walker, CRISPR guide) — each
 with a minimum-nucleotide budget you must pay for.
+
+### Embedded dormant data storage — DNA as a *medium*, not a program
+
+The counterpart to the DNA language: arbitrary authored data — provenance, notes
+from a human or an AI, any encoded payload — stored inside the file as **real
+nucleotide sequences** at 2 bits/base (the same primitive as Church 2012 /
+Goldman 2013 / Erlich 2017). **4 archives ship embedded by default.**
+
+They are **inert by construction, not by convention**:
+
+- **Never executed.** `CODON_LEN` is 5 and all 4^5 = 1,024 codons map to real
+  opcodes, while `execute_genome()` loops every codon with no HALT — so data in
+  an executed strand *would* run as BUILD/CONNECT instructions. Archives are
+  therefore kept out of executed strands entirely.
+- **Invisible to the AI.** The wave-49 retrieval indexer only walks globals
+  satisfying `name.isupper() and isinstance(obj, dict) and len(obj) >= 3`. The
+  store is a **class instance, not a dict**, so it fails `isinstance` and is
+  skipped — that is the whole reason `_DormantArchiveStore` exists.
+- **Zero runtime cost.** Encoded once at import; never touched by `update()`,
+  `on_draw()` or the observers' feature vector.
+- **Dormant until deciphered.** `decipher_archive()` is the only path that
+  returns content. CRC32 over the plaintext means a wrong passphrase is refused
+  rather than silently returning garbage.
+
+```python
+from Simulation import embed_archive, decipher_archive, list_dormant_archives
+
+embed_archive('my.note', 'data from any source', passphrase='...')
+list_dormant_archives()               # metadata only — never payload
+decipher_archive('my.note', '...')    # the only path that wakes it
+```
+
+Archives are genuine sequence: `archive_to_strand(name)` returns a `Strand` with
+a valid complement and **pair integrity 1.000**. Spec:
+[datastorage.md](Python/datastorage.md).
 
 ### The Periodic Machine — a language whose source code is DNA
 
@@ -334,9 +380,47 @@ from Simulation import (simulate_action_potential, compute_metabolic_yield,
 ```
 
 141 exported names: trajectory analysis, force fields, exporters, checkpointing,
-MPI helpers, PBC, thermostats, biology. Hook points: `pre_physics_substep` ·
-`post_physics_substep` · `pre_render_frame` · `post_render_frame` ·
-`pre_observer_think` · `on_organism_spawn`.
+MPI helpers, PBC, thermostats, biology.
+
+### Hooking the simulation
+
+Six lifecycle points fire on the live code path, so you can attach your own code
+to the running simulation without editing it:
+
+```python
+from Simulation import register_hook
+import numpy as np
+
+energies = []
+
+def sample(particles, dt):            # fires once per physics substep
+    # massive: 1/2 m v^2 ; massless (photons) carry energy_kin directly
+    ke = sum(0.5 * p.mass * float(np.dot(p.vel, p.vel)) if p.mass > 0
+             else p.energy_kin for p in particles)
+    energies.append(ke)
+
+register_hook('pre_physics_substep', sample)
+```
+
+| Hook | Fires | Receives |
+|---|---|---|
+| `pre_physics_substep` | before each 960 Hz substep | `(particles, dt)` |
+| `post_physics_substep` | after each substep | `(particles, dt)` |
+| `pre_render_frame` | top of `on_draw()` | `(camera,)` |
+| `post_render_frame` | end of `on_draw()` | `(camera,)` |
+| `pre_observer_think` | before an observer's cognition step | `(observer,)` |
+| `on_organism_spawn` | a life-gen organism reaches the world | `(name, atoms)` |
+
+Measured in one 25-frame harness run: 1000 · 750 · 25 · 25 · 340 · 1 firings.
+A hook that raises is caught and logged — it never kills a frame.
+
+### AI observers that act
+
+Each of the five observers runs its own 12.6 M-parameter `SubconsciousEngine`.
+Its active-inference policy selects an action every fourth cognition step and
+dispatches it into the simulation, so the observers **change the world** rather
+than only watching it — spawning atoms, refocusing, altering the time factor.
+A typical run: 26–33 dispatches per observer, 9–12 distinct actions each.
 
 ---
 
@@ -380,23 +464,54 @@ A multi-day run has a flat memory profile by construction.
 
 ---
 
-## Known gaps
+## Closed gaps
 
-Documented so the list above isn't read as more complete than it is. Detail in
+Every gap this README previously listed is now closed, and each was verified by
+running the program rather than by inspection. Evidence in
 [about.md §20](about.md).
 
-- **Plugin hooks never fire** — `register_hook` accepts callbacks, no
-  `_fire_hooks` call sites exist.
-- **Observer action pathway has no trigger** — the chain from subconscious to
-  action is fully built but nothing calls its first link; observers run on their
-  heuristic scorer.
-- **`Shift+A` and the Mandelbrot panel raise `UnboundLocalError`** — missing
-  `global` declarations.
-- **GPU batch-position path and the render label pool** are complete but never
-  called.
-- Concurrent training race, broken prune rollback, a symbolic self-test that
-  under-reports itself by 16 cases, 24 orphan functions.
-- `Overview.md` line ranges predate the AI-tier replacement.
+- **Plugin hooks fire** — all six lifecycle points. One 33-frame run recorded
+  1,320 / 990 / 33 / 33 / 420 / 1 firings across the six.
+- **Observer action pathway is live** — all five observers act, 6–12 distinct
+  actions each per run, driven by the active-inference policy.
+- **`Shift+A` and the Mandelbrot panel work** — the missing `global`
+  declarations were added; neither raises `UnboundLocalError`.
+- **GPU batch-position path is used** — it drives the dormant-atom batch once a
+  batch clears `_GPU_BATCH_POS_MIN` (2,048 particles). Wiring it also upgraded
+  that path from a non-symplectic `v += a*dt` kick to full velocity-Verlet.
+- **Render label pool is used** — eight per-frame `Label` allocations now
+  recycle through it, and a theme switch clears it.
+- **Concurrent training race fixed** — the three training entry points
+  serialise on one `RLock`.
+- **Prune rollback fixed** — it strips the reparametrisation before reloading,
+  is scoped to a single device, and treats an unmeasurable phi as a failed
+  validation instead of raising.
+- **Symbolic self-test reports honestly** — 81/81 cases pass. It previously
+  resolved only 65 and self-reported the other 16 as FAILED.
+- **`Overview.md` re-keyed** — its line ranges now match the current
+  128,126-line file instead of the 72,612-line one that predates the AI tier.
+
+Six runtime defects found while closing the above are fixed too. Four were
+small: `deque` slicing (`TypeError` in the observer loop), three tkinter
+`Label` widgets built from pyglet's `Label`, a naive `utcnow()`, and an
+autocorrelation that returned `NaN` on a constant trajectory.
+
+**Two were not.** `_build_atom_neighbor_cache` listed each atom as its own
+neighbour, so `_cached_neighbors` was never empty — and two documented
+optimisations test exactly that emptiness. Neither had ever run: the
+chemistry-scan short-circuit and the dormant-atom skip. The same function
+also built its voxel keys with `np.floor()` but queried them with `int()`,
+which disagree for negative coordinates. With both fixed, in an identical
+harness configuration (260 separated atoms, 555 particles, 90 s wall clock)
+completed `update(dt)` calls went from **28 to 113** — roughly **4x** — and
+457 dormant batches totalling 239,921 particle-rows now flow through the
+batch-position path that previously had nothing to dispatch.
+
+**Still true by design:** 32 functions are defined and never called. These are
+legacy aliases (`_gpu_accelerate_positions`), deliberately disabled paths
+(`_init_consciousness_simulator` is commented out at its call site with the
+reason), and public entry points (`main`, `convert_unit`). None is an
+accidental orphan.
 
 ---
 

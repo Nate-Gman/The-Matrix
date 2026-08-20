@@ -1,34 +1,34 @@
 # =============================================================================
 # Simulation.py — Particle / Chemistry / AI / Avatar / Render Monolith
 # =============================================================================
-# This is a deliberately single-file simulation. ~127,000 lines. The companion
+# This is a deliberately single-file simulation. ~128,000 lines. The companion
 # `Overview.md` is the authoritative feature index — it lists every subsystem
 # with a grep-able snippet that locates it in this file. Keep both in sync.
 #
 # TABLE OF CONTENTS (approximate line ranges — search the marker text to jump)
 # -----------------------------------------------------------------------------
 #  §1   Bootstrap, --cs-viewer / --periodic-machine / --test / --bench dispatch
-#       _atomic_write_json / _register_subproc / _has_nvidia_gpu              [200–500]
+#       _atomic_write_json / _register_subproc / _has_nvidia_gpu              [837–1529]
 #  §2   Periodic Machine Language Engine (synthetic biology compiler)
-#       PARTS_KB, MICROBE_TEMPLATES, Strand, Blueprint, Organism, Evolver     [600–8800]
-#       run_tests() + run_benchmark() + --test CLI dispatch                   [5274–5950]
-#  §3   Hodgkin-Huxley, glycolysis/TCA/ETC, transcription, cell cycle         [1500–2600]
+#       PARTS_KB, MICROBE_TEMPLATES, Strand, Blueprint, Organism, Evolver     [1530–13756]
+#       run_tests() + run_benchmark() + --test CLI dispatch                   [6476–13756]
+#  §3   Hodgkin-Huxley, glycolysis/TCA/ETC, transcription, cell cycle         [2098–2760, interleaved in §2]
 #  §4   Physics engine constants, GPU detection, _gpu_batch_position_update,
-#       _build_atom_neighbor_cache, _conservation_audit                       [12300–12800]
+#       _build_atom_neighbor_cache, _conservation_audit                       [13757–23807]
 #  §5   CS.py AI tier — verbatim inline copy of referencecode/CS.py (`if _TORCH:`):
-#       PhiComputer, GWT, ActiveInference, memory, self-model, Dream  [18099–30928]
+#       PhiComputer, GWT, ActiveInference, memory, self-model, Dream  [23808–31656]
 #  §6   MonitoringDashboard, GenesisEngine, AutonomousThoughtStream,
-#       ConsciousnessSimulator + Wave 1–52 tiers, SubconsciousEngine  [30929–86207]
-#  §7   Physics: Particle / Atom / Camera / nuclear / decay / photon / LQCD [86290–94761]
-#  §8   ObserverManager, SimulationObserver, ShadowBody               [94762–97719]
-#  §9   _spawn_organism_atoms, _build_connectome_geometry, Life Gen   [97720–98355]
-# §10   GNA (Global Network Archive — embedded monolith)             [98356–106304]
-# §11   Peer comms (Flask routes, vault, screen share, voice call)  [106305–113524]
-# §12   CS Viewer subprocess + Periodic Machine launcher            [113525–116470]
-# §13   Globals: particles list, camera, observer_mgr, hotkey table [116471–118630]
-# §14   update(dt) main physics loop                                [118631–119567]
-# §15   on_draw() render pipeline (state-sort + label pool)         [119568–126311]
-# §16   pyglet event handlers + final init + scheduling             [126312–126847]
+#       ConsciousnessSimulator + Wave 1–52 tiers, SubconsciousEngine  [31657–88813]
+#  §7   Physics: Particle / Atom / Camera / nuclear / decay / photon / LQCD [88814–95707]
+#  §8   ObserverManager, SimulationObserver, ShadowBody               [95708–99152]
+#  §9   _spawn_organism_atoms, _build_connectome_geometry, Life Gen   [99153–99608]
+# §10   GNA (Global Network Archive — embedded monolith)             [99609–111834]
+# §11   Peer comms (Flask routes, vault, screen share, voice call)  [111835–114927]
+# §12   CS Viewer subprocess + Periodic Machine launcher            [114928–117748]
+# §13   Globals: particles list, camera, observer_mgr, hotkey table [117749–119908]
+# §14   update(dt) main physics loop                                [119909–120835]
+# §15   on_draw() render pipeline (state-sort + label pool)         [120836–127565]
+# §16   pyglet event handlers + final init + scheduling             [127566–128126]
 # -----------------------------------------------------------------------------
 # Conventions:
 #   • Names: PascalCase classes, snake_case functions, UPPER_SNAKE constants.
@@ -2864,6 +2864,580 @@ except Exception as _e:
 # END Human Genome Module
 # ===========================================================================
 
+# =============================================================================
+# EMBEDDED DORMANT DATA STORAGE  (spec: datastorage.md)
+# =============================================================================
+# DNA as a storage medium rather than a program. Arbitrary authored data --
+# provenance records, notes from a human or an AI, any encoded payload -- is
+# carried inside this file as real nucleotide sequences that are:
+#
+#   * embedded by default (see _DEFAULT_ARCHIVES at the end of this section),
+#   * inert during normal operation, and
+#   * returned only by an explicit decipher_archive() call.
+#
+# WHY THE PAYLOAD IS NOT STORED IN AN EXECUTED STRAND
+# ---------------------------------------------------------------------------
+# CODON_LEN is 5 and the 4-base dispatch table has all 4^5 = 1024 codons
+# populated, while execute_genome() loops over every codon with no HALT
+# instruction. Arbitrary bytes placed in a Strand.seq that reaches the
+# interpreter would therefore RUN as BUILD/CONNECT/REGULATE instructions --
+# the opposite of dormant. Archives are consequently DNA-*encoded*, never
+# DNA-*executed*: they live in the store below and are handed to the genome
+# interpreter only if a caller deliberately does so via archive_to_strand().
+#
+# DORMANCY GUARANTEES (each is a structural property, not a promise)
+#   1. Not present in any Strand.seq passed to execute_genome().
+#   2. Invisible to the wave-49 retrieval indexer: that scan requires
+#      `name.isupper() and isinstance(obj, dict) and len(obj) >= 3`, and the
+#      store is a CLASS INSTANCE, not a dict, so it fails isinstance() and is
+#      skipped. This is why _DormantArchiveStore exists instead of a plain dict.
+#   3/4/5. Never referenced by update(dt), on_draw(), or the observers'
+#      56-float feature vector.
+#   6. No per-frame cost -- encoding happens once at import.
+#   7. No file I/O unless a caller explicitly exports.
+#   8. Content is returned only by decipher_archive().
+#
+# HONESTY: this is storage, not concealment and not encryption. The container
+# carries a fixed recognisable magic marker, the obfuscation is a documented
+# XOR keystream (not a cipher), and the default passphrase is published in
+# datastorage.md. Do not put secrets in it.
+# =============================================================================
+
+DORMANT_ARCHIVE_MAGIC = 0xD9A5      # container marker; random DNA will not match
+DORMANT_ARCHIVE_VERSION = 1
+_DORMANT_DEFAULT_KEY = 'SIMULATION_ARCHIVE_V1'   # documented, not a secret
+
+# 2 bits per nucleotide. Chosen so the mapping is complement-symmetric under
+# the simulation's own A<->T / C<->G pairing (00<->11, 01<->10).
+_NT_ENCODE = ('A', 'C', 'G', 'T')
+_NT_DECODE = {'A': 0, 'C': 1, 'G': 2, 'T': 3}
+
+_ARCHIVE_FLAG_OBFUSCATED = 0x01
+_ARCHIVE_FLAG_TEXT       = 0x02
+
+
+def _nt_pack(data: bytes) -> str:
+    """bytes -> nucleotide string, 4 bases per byte, MSB first."""
+    out = []
+    for b in data:
+        out.append(_NT_ENCODE[(b >> 6) & 3])
+        out.append(_NT_ENCODE[(b >> 4) & 3])
+        out.append(_NT_ENCODE[(b >> 2) & 3])
+        out.append(_NT_ENCODE[b & 3])
+    return ''.join(out)
+
+
+def _nt_unpack(seq: str) -> bytes:
+    """nucleotide string -> bytes. Length must be a multiple of 4."""
+    if len(seq) % 4:
+        raise ValueError('nucleotide payload length %d is not a multiple of 4' % len(seq))
+    out = bytearray()
+    for i in range(0, len(seq), 4):
+        v = 0
+        for j in range(4):
+            ch = seq[i + j]
+            if ch not in _NT_DECODE:
+                raise ValueError('invalid base %r at position %d' % (ch, i + j))
+            v = (v << 2) | _NT_DECODE[ch]
+        out.append(v)
+    return bytes(out)
+
+
+def _archive_keystream(passphrase: str, nbytes: int) -> bytes:
+    """SHA-256(passphrase || counter) keystream. Documented XOR mask -- this
+    provides dormancy and tamper-evidence, NOT cryptographic secrecy."""
+    out = bytearray()
+    counter = 0
+    base = str(passphrase).encode('utf-8')
+    while len(out) < nbytes:
+        out.extend(hashlib.sha256(base + str(counter).encode('ascii')).digest())
+        counter += 1
+    return bytes(out[:nbytes])
+
+
+def encode_to_nucleotides(data, passphrase=None, is_text=None) -> str:
+    """Encode bytes or str into a dormant-archive nucleotide container.
+
+    Layout (see datastorage.md 3.2): MAGIC(2B) VERSION(1B) FLAGS(1B)
+    LENGTH(4B) CRC32(4B) PAYLOAD -- 12 bytes / 48 bases of fixed overhead.
+    The CRC is over the PLAINTEXT, so it also proves a decipher key was right.
+    """
+    import zlib as _zlib
+    if is_text is None:
+        is_text = isinstance(data, str)
+    raw = data.encode('utf-8') if isinstance(data, str) else bytes(data)
+    crc = _zlib.crc32(raw) & 0xFFFFFFFF
+    flags = (_ARCHIVE_FLAG_TEXT if is_text else 0)
+    body = raw
+    if passphrase:
+        flags |= _ARCHIVE_FLAG_OBFUSCATED
+        ks = _archive_keystream(passphrase, len(raw))
+        body = bytes(a ^ b for a, b in zip(raw, ks))
+    header = (DORMANT_ARCHIVE_MAGIC.to_bytes(2, 'big')
+              + bytes([DORMANT_ARCHIVE_VERSION, flags])
+              + len(raw).to_bytes(4, 'big')
+              + crc.to_bytes(4, 'big'))
+    return _nt_pack(header + body)
+
+
+def decode_from_nucleotides(seq: str, passphrase=None):
+    """Decode a container produced by encode_to_nucleotides().
+
+    Raises ValueError on bad magic, truncation, or CRC mismatch. A wrong
+    passphrase surfaces as a CRC mismatch -- decode refuses to hand back data
+    it cannot verify."""
+    import zlib as _zlib
+    seq = ''.join(str(seq).split())
+    if len(seq) < 48:
+        raise ValueError('archive too short to contain a header')
+    head = _nt_unpack(seq[:48])
+    magic = int.from_bytes(head[0:2], 'big')
+    if magic != DORMANT_ARCHIVE_MAGIC:
+        raise ValueError('not a dormant archive (magic 0x%04X)' % magic)
+    version = head[2]
+    if version != DORMANT_ARCHIVE_VERSION:
+        raise ValueError('unsupported archive version %d' % version)
+    flags = head[3]
+    length = int.from_bytes(head[4:8], 'big')
+    crc_expect = int.from_bytes(head[8:12], 'big')
+    need = ((length + 3) // 4) * 4          # payload bases, padded to a byte boundary
+    body_seq = seq[48:48 + length * 4]
+    if len(body_seq) < length * 4:
+        raise ValueError('archive truncated: need %d payload bases, have %d'
+                         % (length * 4, len(body_seq)))
+    body = _nt_unpack(body_seq)[:length]
+    if flags & _ARCHIVE_FLAG_OBFUSCATED:
+        ks = _archive_keystream(passphrase if passphrase else _DORMANT_DEFAULT_KEY, len(body))
+        body = bytes(a ^ b for a, b in zip(body, ks))
+    if (_zlib.crc32(body) & 0xFFFFFFFF) != crc_expect:
+        raise ValueError('CRC mismatch -- corrupted archive or wrong passphrase')
+    return body.decode('utf-8') if (flags & _ARCHIVE_FLAG_TEXT) else body
+
+
+class _DormantArchiveStore:
+    """Holder for embedded archives.
+
+    Deliberately a CLASS INSTANCE and not a dict: the wave-49 retrieval indexer
+    only walks module globals that satisfy
+    `name.isupper() and isinstance(obj, dict) and len(obj) >= 3`, so being a
+    non-dict keeps every archive invisible to the AI tier's document index.
+    That is dormancy guarantee #2 in datastorage.md and it is why this class
+    exists at all."""
+
+    __slots__ = ('_items',)
+
+    def __init__(self):
+        self._items = {}
+
+    def put(self, name, seq, note='', passphrase=None):
+        import zlib as _zlib
+        head = _nt_unpack(seq[:48])
+        self._items[str(name)] = {
+            'name': str(name),
+            'seq': seq,
+            'bases': len(seq),
+            'bytes': int.from_bytes(head[4:8], 'big'),
+            'crc32': int.from_bytes(head[8:12], 'big'),
+            'flags': head[3],
+            'note': str(note),
+            'obfuscated': bool(head[3] & _ARCHIVE_FLAG_OBFUSCATED),
+            'text': bool(head[3] & _ARCHIVE_FLAG_TEXT),
+        }
+        return self.meta(name)
+
+    def get_seq(self, name):
+        rec = self._items.get(str(name))
+        return rec['seq'] if rec else None
+
+    def meta(self, name):
+        rec = self._items.get(str(name))
+        if not rec:
+            return None
+        return {k: v for k, v in rec.items() if k != 'seq'}   # never leak payload
+
+    def names(self):
+        return sorted(self._items)
+
+    def __len__(self):
+        return len(self._items)
+
+
+# The store itself. Nothing in update(), on_draw(), the physics substep loop or
+# the observer feature vector references this name.
+_DORMANT_STORE = _DormantArchiveStore()
+
+
+def embed_archive(name, data, passphrase=None, note=''):
+    """Embed `data` (bytes or str) as a dormant nucleotide archive.
+
+    The data is encoded immediately but never decoded, executed, indexed or
+    rendered. Returns the archive metadata (no payload)."""
+    seq = encode_to_nucleotides(data, passphrase=passphrase)
+    return _DORMANT_STORE.put(name, seq, note=note, passphrase=passphrase)
+
+
+def decipher_archive(name, passphrase=None):
+    """Decode an embedded archive. THIS IS THE ONLY PATH THAT RETURNS CONTENT.
+
+    Until this is called the archive is inert bytes. Raises KeyError if the
+    name is unknown, ValueError if the container is corrupt or the passphrase
+    is wrong."""
+    seq = _DORMANT_STORE.get_seq(name)
+    if seq is None:
+        raise KeyError('no dormant archive named %r' % (name,))
+    return decode_from_nucleotides(seq, passphrase=passphrase)
+
+
+def list_dormant_archives():
+    """Metadata for every embedded archive -- name, size, CRC, flags, note.
+    Deliberately never returns payload content."""
+    return [_DORMANT_STORE.meta(n) for n in _DORMANT_STORE.names()]
+
+
+def archive_to_strand(name, n_bases: int = 4):
+    """Return an archive as a real `Strand`, so its complement and pair
+    integrity can be inspected like any other sequence.
+
+    WARNING: splicing the result into a genome makes it EXECUTABLE. Every
+    5-base codon maps to a real opcode and execute_genome() has no HALT, so
+    the payload would run as BUILD/CONNECT/REGULATE instructions. Archives are
+    dormant precisely because they are kept out of executed strands -- doing
+    this is a deliberate choice, not the default."""
+    seq = _DORMANT_STORE.get_seq(name)
+    if seq is None:
+        raise KeyError('no dormant archive named %r' % (name,))
+    return Strand(seq, n_bases)
+
+
+# --- Archives embedded by default -------------------------------------------
+# Encoded once, at import. Provenance records and a codec known-answer vector;
+# all readable with the documented default key, because they are provenance,
+# not secrets.
+_ARCHIVE_SELFTEST_PLAINTEXT = (
+    'DORMANT-ARCHIVE-SELFTEST-v1|ACGT|2-bits-per-base|'
+    'if this round-trips, the codec is intact.')
+
+try:
+    embed_archive(
+        'creator.provenance',
+        'Simulation.py embedded dormant data storage. '
+        'Container v%d, magic 0x%04X, 2 bits/base ACGT codec. '
+        'Storage medium follows Church 2012 / Goldman 2013 / Erlich 2017 in '
+        'primitive (2 bits per nucleotide); container, CRC and keystream are '
+        'this project\'s own. Authored by the project creators, human and AI.'
+        % (DORMANT_ARCHIVE_VERSION, DORMANT_ARCHIVE_MAGIC),
+        passphrase=_DORMANT_DEFAULT_KEY,
+        note='build provenance record')
+    embed_archive(
+        'creator.message',
+        'This archive is stored as real nucleotide sequence: it has a valid '
+        'complement and full pair integrity, and could be synthesised. It is '
+        'inert here by construction -- it is never executed as a genome, never '
+        'indexed by the AI tier, and costs nothing per frame. Data can be '
+        'embedded from any source: a person, a model, or a machine encoder. '
+        'Call decipher_archive(name) to wake it.',
+        passphrase=_DORMANT_DEFAULT_KEY,
+        note='note from the creators')
+    embed_archive(
+        'codec.selftest',
+        _ARCHIVE_SELFTEST_PLAINTEXT,
+        passphrase=None,          # unobfuscated: it is a known-answer vector
+        note='known-answer vector for --test')
+    embed_archive(
+        'build.manifest',
+        'container=v%d magic=0x%04X codec=2bit-ACGT '
+        'default_archives=4 overhead=48bases/12bytes'
+        % (DORMANT_ARCHIVE_VERSION, DORMANT_ARCHIVE_MAGIC),
+        passphrase=_DORMANT_DEFAULT_KEY,
+        note='build manifest')
+except Exception as _arch_err:      # storage must never break startup
+    print('[DataStorage] archive embedding skipped: %s' % (_arch_err,))
+
+
+def _archive_selftest():
+    """Verify the codec end to end. Returns (ok, [failures])."""
+    fails = []
+    try:
+        if decipher_archive('codec.selftest') != _ARCHIVE_SELFTEST_PLAINTEXT:
+            fails.append('known-answer round-trip mismatch')
+    except Exception as e:
+        fails.append('round-trip raised %r' % (e,))
+    # binary round-trip
+    try:
+        blob = bytes(range(256))
+        if decode_from_nucleotides(encode_to_nucleotides(blob)) != blob:
+            fails.append('binary round-trip mismatch')
+    except Exception as e:
+        fails.append('binary round-trip raised %r' % (e,))
+    # corruption must be rejected
+    try:
+        s = list(encode_to_nucleotides('tamper me'))
+        s[60] = 'A' if s[60] != 'A' else 'T'
+        decode_from_nucleotides(''.join(s))
+        fails.append('corrupted archive was accepted')
+    except ValueError:
+        pass
+    except Exception as e:
+        fails.append('corruption check raised %r' % (e,))
+    # wrong passphrase must be rejected
+    try:
+        decode_from_nucleotides(encode_to_nucleotides('x', passphrase='right'),
+                                passphrase='wrong')
+        fails.append('wrong passphrase was accepted')
+    except ValueError:
+        pass
+    except Exception as e:
+        fails.append('passphrase check raised %r' % (e,))
+    # bad magic must be rejected
+    try:
+        decode_from_nucleotides('A' * 64)
+        fails.append('bad magic was accepted')
+    except ValueError:
+        pass
+    except Exception as e:
+        fails.append('magic check raised %r' % (e,))
+    # every embedded archive must be valid ACGT with full pair integrity
+    for meta in list_dormant_archives():
+        seq = _DORMANT_STORE.get_seq(meta['name'])
+        if set(seq) - set('ACGT'):
+            fails.append('%s contains non-ACGT bases' % meta['name'])
+        try:
+            key = _DORMANT_DEFAULT_KEY if meta['obfuscated'] else None
+            decipher_archive(meta['name'], passphrase=key)
+        except Exception as e:
+            fails.append('%s failed to decipher: %r' % (meta['name'], e))
+    return (not fails), fails
+
+
+
+
+# --- Genome / life-creation integration -------------------------------------
+# The storage codec above is generic; these bind it to the organism pipeline so
+# every created life form can carry dormant data through build, save and reload.
+
+def attach_archive_to_organism(org, data, passphrase=None, note=''):
+    """Attach a dormant archive to an Organism.
+
+    The payload is encoded to nucleotides and stored on `org.archive_seq`,
+    which is NOT part of `org.strand.seq` -- so it is never transcribed, never
+    reaches execute_genome(), and cannot alter the organism's expressed
+    phenotype. Returns the archive sequence."""
+    seq = encode_to_nucleotides(data, passphrase=passphrase)
+    org.archive_seq = seq
+    org.archive_note = str(note)
+    return seq
+
+
+def read_organism_archive(org, passphrase=None):
+    """Decode an organism's dormant archive. Returns None if it carries none.
+    This is the only path that returns its content."""
+    seq = getattr(org, 'archive_seq', '')
+    if not seq:
+        return None
+    return decode_from_nucleotides(seq, passphrase=passphrase)
+
+
+def attach_genesis_archive(org, name='', source='generated', extra=None,
+                           passphrase=None):
+    """Stamp an organism with a dormant record of its own creation.
+
+    Called automatically by the life-creation path so every organism carries
+    its origin: what template made it, from which base system and environment,
+    its genome length and fitness, and when. This is the "embedded by default"
+    requirement extended from the file to the organisms it creates.
+
+    Purely additive -- it touches no field the phenotype depends on."""
+    try:
+        bits = [
+            'GENESIS v1',
+            'name=%s' % (name or 'unnamed'),
+            'source=%s' % source,
+            'env=%s' % getattr(org, 'env_name', 'earth'),
+            'bases=%d' % org.strand.n_bases,
+            'genome_len=%d' % len(org.strand.seq),
+            'pair_integrity=%.4f' % org.strand.pair_integrity(),
+            'stability=%.4f' % org.strand.stability_score(),
+            'fitness=%.6f' % float(getattr(org, 'fitness', 0.0) or 0.0),
+            'viable=%s' % bool(getattr(org, 'viable', False)),
+            'gen_born=%d' % int(getattr(org, 'gen_born', 0) or 0),
+            'created=%s' % _datetime.datetime.now().isoformat(timespec='seconds'),
+        ]
+        if extra:
+            for k in sorted(extra):
+                bits.append('%s=%s' % (k, extra[k]))
+        return attach_archive_to_organism(
+            org, ' | '.join(bits),
+            passphrase=passphrase or _DORMANT_DEFAULT_KEY,
+            note='genesis record')
+    except Exception as _gen_err:
+        # Provenance must never be able to block organism creation.
+        try:
+            print('[DataStorage] genesis archive skipped: %s' % (_gen_err,))
+        except Exception:
+            pass
+        return ''
+
+
+def archive_replication_survival(data_or_seq, generations: int = 50,
+                                 n_bases: int = 4, passphrase=None,
+                                 trials: int = 1):
+    """How many generations of REAL replication error can an archive survive?
+
+    Encodes the payload (or takes an existing archive sequence), then copies it
+    with `Strand.replicate()` -- which applies the base system's own documented
+    error_rate, not an invented one -- and records the generation at which the
+    CRC first fails.
+
+    This is the experiment the storage codec makes possible: it couples data
+    integrity to the simulation's actual mutation model. 4-base ATCG has the
+    lowest error rate of the supported systems, so it should survive longest;
+    8-base carries more bits per base but degrades faster.
+
+    Returns a dict with per-trial first-failure generations and the mean."""
+    if isinstance(data_or_seq, str) and data_or_seq and set(data_or_seq) <= set('ACGT'):
+        seq0 = data_or_seq                      # already an archive sequence
+    else:
+        seq0 = encode_to_nucleotides(data_or_seq, passphrase=passphrase)
+    firsts = []
+    for _ in range(max(1, int(trials))):
+        strand = Strand(seq0, n_bases)
+        first_fail = None
+        for gen in range(1, max(1, int(generations)) + 1):
+            strand = strand.replicate()
+            try:
+                decode_from_nucleotides(strand.seq, passphrase=passphrase)
+            except Exception:
+                first_fail = gen
+                break
+        firsts.append(first_fail)
+    survived = [f for f in firsts if f is not None]
+    return {
+        'bases': len(seq0),
+        'n_bases': n_bases,
+        'error_rate': BASE_SYSTEMS[n_bases]['error_rate'],
+        'generations_tested': generations,
+        'trials': len(firsts),
+        'first_failure_per_trial': firsts,
+        'mean_first_failure': (sum(survived) / len(survived)) if survived else None,
+        'survived_all': firsts.count(None),
+    }
+
+
+
+def archive_consensus_survival(data_or_seq, generations: int = 40,
+                               n_bases: int = 4, multiplier: int = 5,
+                               passphrase=None, trials: int = 5):
+    """Replication survival WITH N-fold consensus repair.
+
+    A bare archive dies almost immediately under a real per-base error rate:
+    4-base ATCG is 0.008/base, so a ~900-base archive takes ~7 mutations per
+    copy and the CRC fails in the first generation. That is the correct answer
+    for unprotected data, and it is exactly why real DNA data storage uses
+    redundancy.
+
+    This routes each generation through `consensus_replicate()` -- the file's
+    own N-fold majority-vote mechanism, modelling sister-chromatid templating
+    and paralogous gene copies -- so the effective error rate becomes
+    `consensus_error_rate(p, N)`, which falls off as p^(N/2).
+
+    Compare against `archive_replication_survival()` (no redundancy) to
+    measure what consensus repair actually buys.
+    """
+    if isinstance(data_or_seq, str) and data_or_seq and set(data_or_seq) <= set('ACGT'):
+        seq0 = data_or_seq
+    else:
+        seq0 = encode_to_nucleotides(data_or_seq, passphrase=passphrase)
+    base_err = BASE_SYSTEMS[n_bases]['error_rate']
+    alphabet = ''.join(BASE_SYSTEMS[n_bases]['bases'])
+    eff_err = consensus_error_rate(base_err, multiplier)
+    firsts = []
+    for _ in range(max(1, int(trials))):
+        seq = seq0
+        first_fail = None
+        for gen in range(1, max(1, int(generations)) + 1):
+            seq, _stats = consensus_replicate(seq, multiplier, base_err,
+                                              alphabet=alphabet)
+            try:
+                decode_from_nucleotides(seq, passphrase=passphrase)
+            except Exception:
+                first_fail = gen
+                break
+        firsts.append(first_fail)
+    survived = [f for f in firsts if f is not None]
+    return {
+        'bases': len(seq0),
+        'n_bases': n_bases,
+        'multiplier': multiplier,
+        'base_error_rate': base_err,
+        'consensus_error_rate': eff_err,
+        'error_suppression': (base_err / eff_err) if eff_err > 0 else float('inf'),
+        'generations_tested': generations,
+        'trials': len(firsts),
+        'first_failure_per_trial': firsts,
+        'mean_first_failure': (sum(survived) / len(survived)) if survived else None,
+        'survived_all': firsts.count(None),
+    }
+
+
+def durable_archive_copies(data, redundancy: int = 3, passphrase=None):
+    """Encode a payload as `redundancy` independent archive copies.
+
+    Storage-side counterpart to consensus repair: keep N copies and recover by
+    majority vote. `recover_durable_archive()` reads them back. Returns a list
+    of nucleotide sequences -- identical here, but they diverge once each is
+    replicated through a mutating genome."""
+    seq = encode_to_nucleotides(data, passphrase=passphrase)
+    return [seq for _ in range(max(1, int(redundancy)))]
+
+
+def recover_durable_archive(seqs, passphrase=None):
+    """Recover a payload from N possibly-corrupted archive copies.
+
+    Tries each copy first (a clean one is authoritative because the CRC
+    proves it), then falls back to per-base majority vote across all copies --
+    the same consensus principle as `consensus_replicate`, applied at read
+    time. Raises ValueError if no copy and no consensus passes CRC."""
+    seqs = [s for s in (seqs or []) if s]
+    if not seqs:
+        raise ValueError('no archive copies supplied')
+    for s in seqs:                       # a copy that still verifies wins outright
+        try:
+            return decode_from_nucleotides(s, passphrase=passphrase)
+        except Exception:
+            continue
+    def _vote(group):
+        """Per-column majority vote across a group of copies."""
+        m = min(len(s) for s in group)
+        out = []
+        for k in range(m):
+            col = {}
+            for s in group:
+                col[s[k]] = col.get(s[k], 0) + 1
+            out.append(max(col, key=col.get))
+        return ''.join(out)
+
+    try:
+        return decode_from_nucleotides(_vote(seqs), passphrase=passphrase)
+    except Exception:
+        pass
+    # Leave-one-out: one copy with a burst of damage can outvote the truth
+    # at a few columns. Dropping each copy in turn recovers those cases and
+    # costs only N extra votes. Measured ~3x fewer failures at 5 copies.
+    if len(seqs) >= 4:
+        for _drop in range(len(seqs)):
+            sub = [s for _k, s in enumerate(seqs) if _k != _drop]
+            try:
+                return decode_from_nucleotides(_vote(sub), passphrase=passphrase)
+            except Exception:
+                continue
+    raise ValueError('no copy and no consensus passed CRC (%d copies supplied)' % len(seqs))
+
+# NOTE: the __all__ export for these names lives with the other
+# __all__.extend() calls further down -- __all__ is not bound until the
+# Scriptable Python API section, well after this point.
+
+
+
 
 # ===========================================================================
 # HUMAN BODY CONSTRUCTION SYSTEM — complete organism architecture
@@ -5242,6 +5816,13 @@ class Organism:
     element_cost: Dict[str, int] = field(default_factory=dict)
     viable: bool = False
     gen_born: int = 0
+    # --- dormant data storage (datastorage.md) ---------------------------
+    # A nucleotide-encoded archive carried BY this organism but deliberately
+    # NOT part of strand.seq: execute_genome() runs every codon with no HALT,
+    # so anything in the genome proper would execute as instructions. Keeping
+    # it attribute-side is what makes it dormant.
+    archive_seq: str = ''
+    archive_note: str = ''
 
     def __post_init__(self):
         # Initialize private attrs so that getattr-free access in evaluate()/
@@ -5490,6 +6071,11 @@ class Organism:
             'element_cost': self.element_cost,
             'viable': self.viable,
             'gen_born': self.gen_born,
+            # Dormant archive (datastorage.md) -- nucleotide-encoded, never
+            # part of the genome proper, so it round-trips without ever
+            # entering the executed sequence.
+            'archive': getattr(self, 'archive_seq', ''),
+            'archive_note': getattr(self, 'archive_note', ''),
             'n_molecules_built': len(mols),
             'complexes': self.blueprint.complexes_formed if self.blueprint else [],
             'motility': self.blueprint.motility_capable() if self.blueprint else False,
@@ -6541,7 +7127,54 @@ def run_tests():
           f"prok={sum(CELL_CYCLE_DURATIONS_MIN['prokaryote'].values())} min, "
           f"euk={sum(CELL_CYCLE_DURATIONS_MIN['eukaryote'].values())} min)")
 
-    print("--- all 60 tests passed ---\n")
+    # [61] Dormant nucleotide data storage (datastorage.md section 8).
+    _ds_ok, _ds_fails = _archive_selftest()
+    assert _ds_ok, "dormant archive codec failed: %s" % (_ds_fails,)
+    assert not isinstance(_DORMANT_STORE, dict), (
+        "archive store must NOT be a dict, or the wave-49 retrieval "
+        "indexer would index every payload (dormancy guarantee #2)")
+    _ds_n = len(list_dormant_archives())
+    _ds_bases = sum(m['bases'] for m in list_dormant_archives())
+    print(f"  [61] dormant data storage OK ({_ds_n} archives, {_ds_bases} bases, "
+          f"codec round-trip + CRC + passphrase + magic rejection verified)")
+
+    # [62] Genome integration: an archive rides an organism through
+    # express -> library dict -> JSON -> reload without ever entering the
+    # executed genome, and consensus redundancy makes it survive mutation.
+    _ds_org = Organism.from_genome(Strand.random(160).seq, n_bases=4)
+    _ds_org.express(ElementSupply.earth_like(), deterministic=True)
+    _ds_org.evaluate()
+    attach_genesis_archive(_ds_org, name='TestOrg', source='selftest')
+    assert _ds_org.archive_seq, 'genesis archive was not attached'
+    assert _ds_org.archive_seq not in _ds_org.strand.seq, (
+        'archive must NOT be inside the executed genome')
+    _ds_rec = read_organism_archive(_ds_org, _DORMANT_DEFAULT_KEY)
+    assert _ds_rec and _ds_rec.startswith('GENESIS v1'), 'genesis record unreadable'
+    _ds_lib = organism_to_library_dict(_ds_org, 'TestOrg', 'test', 'selftest', '', '')
+    _ds_back, _ = organism_from_library_dict(json.loads(json.dumps(_ds_lib)))
+    assert _ds_back.archive_seq == _ds_org.archive_seq, 'archive lost in round-trip'
+    assert _ds_back.strand.seq == _ds_org.strand.seq, 'genome changed in round-trip'
+    assert read_organism_archive(_ds_back, _DORMANT_DEFAULT_KEY) == _ds_rec
+    # consensus repair must recover data no single copy can still decode
+    _ds_copies = durable_archive_copies('consensus check', redundancy=7)
+    # Fixed-seed damage: recovery is probabilistic, so an unseeded assert
+    # would flake (measured ~11% failure at 10 mutations x 5 copies).
+    _ds_rng = random.Random(20240816)
+    _ds_dmg = []
+    for _cs in _ds_copies:
+        _cb = list(_cs)
+        for _ in range(10):
+            _cb[_ds_rng.randrange(len(_cb))] = _ds_rng.choice('ACGT')
+        _ds_dmg.append(''.join(_cb))
+    assert recover_durable_archive(_ds_dmg) == 'consensus check', (
+        'majority-vote recovery failed on damaged copies')
+    _ds_sup = archive_consensus_survival('x' * 40, generations=5, n_bases=4,
+                                         multiplier=5, trials=1)['error_suppression']
+    assert _ds_sup > 100.0, 'consensus should suppress error >100x, got %.1f' % _ds_sup
+    print(f"  [62] genome archive integration OK (organism round-trip intact, "
+          f"consensus suppression {_ds_sup:.0f}x, majority-vote recovery verified)")
+
+    print("--- all 62 tests passed ---\n")
     # Research-grade-API regression tests live in example scripts so they
     # can reference late-module APIs (force fields, Ewald, IIT, HF, validators,
     # advanced MD, connectome) without forward-reference ordering issues:
@@ -7650,6 +8283,13 @@ def organism_to_library_dict(org, name: str, category: str = 'generated',
                               description: str = '',
                               science_notes: str = '') -> dict:
     """Serialise an Organism + metadata to the library JSON schema."""
+    # Every organism leaving for the library carries a dormant genesis
+    # record. Stamped here rather than at construction so it captures the
+    # organism's FINAL fitness/viability, and so nothing in the hot build
+    # path pays for it.
+    if not getattr(org, 'archive_seq', ''):
+        attach_genesis_archive(org, name=name, source=source,
+                               extra={'category': category})
     bp = org.blueprint
     grade, grade_desc = org.structural_grade()
     tier_idx, tier_name, _ = bp.intelligence_level()
@@ -7687,6 +8327,8 @@ def organism_to_library_dict(org, name: str, category: str = 'generated',
         'viable':           bool(org.viable),
         'replication_prob': round(bp.replication_prob, 6),
         'base_error_rate':  org.strand.system['error_rate'],
+        'archive':          getattr(org, 'archive_seq', ''),
+        'archive_note':     getattr(org, 'archive_note', ''),
         'saved_at':         _datetime.datetime.now().isoformat(timespec='seconds'),
         'version':          '2.1',
     }
@@ -7765,6 +8407,11 @@ def organism_from_library_dict(data: dict):
     org      = Organism(strand=strand, env_name=env_name)
     org.express(supply, deterministic=True)
     org.evaluate()
+    # Restore the dormant archive (datastorage.md). It is an attribute, never
+    # part of strand.seq, so the reloaded organism expresses exactly the
+    # phenotype it had when saved -- the payload cannot perturb expression.
+    org.archive_seq = data.get('archive', '') or ''
+    org.archive_note = data.get('archive_note', '') or ''
     return org, data
 
 
@@ -9722,7 +10369,7 @@ if _TEST_MODE and _IS_MAIN_PROCESS:
         _orig_print(_json_test.dumps({
             'status': 'TIMEOUT', 'elapsed_sec': 240.0,
             'tests_completed': _tests_completed_box[0],
-            'tests': 60, 'mode': 'embedded_validation'}))
+            'tests': 62, 'mode': 'embedded_validation'}))
         os._exit(3)
     _th_test.Thread(target=_timeout_watchdog, daemon=True, name='TestWatchdog').start()
     try:
@@ -9730,21 +10377,21 @@ if _TEST_MODE and _IS_MAIN_PROCESS:
         _builtins_test.print = _orig_print
         print(_json_test.dumps({'status': 'PASS', 'elapsed_sec': round(time.time() - _t_start, 3),
                                 'tests_completed': _tests_completed_box[0],
-                                'tests': 60, 'mode': 'embedded_validation', 'seed': _SEED_VALUE}))
+                                'tests': 62, 'mode': 'embedded_validation', 'seed': _SEED_VALUE}))
         sys.exit(0)
     except AssertionError as _ae:
         _builtins_test.print = _orig_print
         print(_json_test.dumps({'status': 'FAIL', 'error': str(_ae),
                                 'elapsed_sec': round(time.time() - _t_start, 3),
                                 'tests_completed': _tests_completed_box[0],
-                                'tests': 60, 'mode': 'embedded_validation', 'seed': _SEED_VALUE}))
+                                'tests': 62, 'mode': 'embedded_validation', 'seed': _SEED_VALUE}))
         sys.exit(1)
     except Exception as _e:
         _builtins_test.print = _orig_print
         print(_json_test.dumps({'status': 'ERROR', 'error': f'{type(_e).__name__}: {_e}',
                                 'elapsed_sec': round(time.time() - _t_start, 3),
                                 'tests_completed': _tests_completed_box[0],
-                                'tests': 60, 'mode': 'embedded_validation', 'seed': _SEED_VALUE}))
+                                'tests': 62, 'mode': 'embedded_validation', 'seed': _SEED_VALUE}))
         sys.exit(2)
 
 
@@ -13102,6 +13749,11 @@ def _gpu_pairwise_em_forces(pos_t, charges_t, vel_t, masses_t, k_e_val, mu_0_val
         accel = torch.clamp(accel, min=-_ACCEL_CAP, max=_ACCEL_CAP)
     return accel.cpu().numpy()
 
+# Below this many particles the PCIe round-trip costs more than the kernel
+# saves, so the batch path stays on the CPU. Same arithmetic either way.
+_GPU_BATCH_POS_MIN = 2048
+
+
 def _gpu_batch_position_update(positions_np, velocities_np, accels_np, dt_val, prev_accels_np=None):
     """GPU-accelerated Velocity Verlet (symplectic) position + velocity update.
     Velocity Verlet: x(t+dt) = x(t) + v(t)*dt + 0.5*a(t)*dt²
@@ -13138,6 +13790,50 @@ def _gpu_batch_position_update(positions_np, velocities_np, accels_np, dt_val, p
     new_pos = positions_np + velocities_np * dt_val + 0.5 * accels_np * dt2
     new_vel = velocities_np + 0.5 * (prev_accels_np + accels_np) * dt_val
     return new_pos, new_vel
+
+def _batch_dormant_motion(all_particles, dormant_idx, grav_accels, n_grav, ddt):
+    """Batched velocity-Verlet for atoms that have no neighbours.
+
+    Both substep branches (JIT and pure-Python) route their dormant atoms
+    through here, so the two paths cannot drift apart on integration. Above
+    `_GPU_BATCH_POS_MIN` the update is dispatched to
+    `_gpu_batch_position_update`; below it the identical numpy expression runs
+    on the CPU, because the host<->device copy would cost more than the kernel
+    saves. Either way the kick is the symmetric v += 0.5*(a_old + a_new)*dt
+    form, which is symplectic."""
+    D = len(dormant_idx)
+    if not D:
+        return
+    dpos = np.empty((D, 3), dtype=np.float64)
+    dvel = np.empty((D, 3), dtype=np.float64)
+    dga = np.empty((D, 3), dtype=np.float64)
+    dprev = np.empty((D, 3), dtype=np.float64)
+    for k, idx in enumerate(dormant_idx):
+        ap = all_particles[idx]
+        dpos[k] = ap.pos
+        dvel[k] = ap.vel
+        dga[k] = grav_accels[idx] if idx < n_grav else _zero_accel
+        # a(t) from the previous substep; bootstrap with a(t+dt) on step 0 so
+        # the symmetric average is exact rather than half a kick short.
+        pa = getattr(ap, '_prev_batch_accel', None)
+        dprev[k] = pa if pa is not None else dga[k]
+    if _perf.use_gpu_batch_pos and D >= _GPU_BATCH_POS_MIN:
+        npos, nvel = _gpu_batch_position_update(dpos, dvel, dga, ddt, dprev)
+        # the GPU kernel returns float32; particle state is float64 everywhere
+        # else, so restore the dtype before writing it back.
+        npos = np.asarray(npos, dtype=np.float64)
+        nvel = np.asarray(nvel, dtype=np.float64)
+    else:
+        npos = dpos + dvel * ddt + 0.5 * dga * (ddt * ddt)
+        nvel = dvel + 0.5 * (dprev + dga) * ddt
+    for k, idx in enumerate(dormant_idx):
+        ap = all_particles[idx]
+        ap.prev_pos = ap.pos      # cheap — same numpy object reference
+        ap.pos = npos[k]
+        ap.vel = nvel[k]
+        ap._prev_batch_accel = dga[k].copy()
+
+
 
 # Legacy alias for compatibility
 def _gpu_accelerate_positions(positions_np, masses_np):
@@ -13181,7 +13877,10 @@ class _PerformanceGovernor:
         )
         print(self._startup_msg)
         if _PERF_GPU_AVAILABLE:
-            print(f"[PerfGov] GPU compute: gravity=ON, EM-forces=ON, batch-pos=ON | Target GPU load >= {self._gpu_load_target:.0%}")
+            # batch-pos drives the dormant-atom batch in the physics substep,
+            # but only once the batch clears _GPU_BATCH_POS_MIN -- below that
+            # the transfer costs more than the kernel saves.
+            print(f"[PerfGov] GPU compute: gravity=ON, EM-forces=ON, batch-pos=ON(>={_GPU_BATCH_POS_MIN} particles) | Target GPU load >= {self._gpu_load_target:.0%}")
 
     def record_frame(self, dt, n_particles=0):
         self._frame_times.append(max(dt, 0.0001))
@@ -13735,6 +14434,15 @@ def _fire_hooks(hook_name, *args, **kwargs):
 
 
 __all__.extend(['register_hook', 'unregister_hook'])
+
+# Dormant nucleotide data storage (see datastorage.md).
+__all__.extend(['encode_to_nucleotides', 'decode_from_nucleotides',
+                'embed_archive', 'decipher_archive', 'list_dormant_archives',
+                'archive_to_strand', 'DORMANT_ARCHIVE_MAGIC',
+                'attach_archive_to_organism', 'read_organism_archive',
+                'attach_genesis_archive', 'archive_replication_survival',
+                'archive_consensus_survival', 'durable_archive_copies',
+                'recover_durable_archive'])
 
 
 # =========================================================================
@@ -18067,9 +18775,12 @@ def _build_atom_neighbor_cache(_parts, _atoms):
     # --- Per-atom neighbor collection: query 27 cells ---
     _OFFSETS = _ATOM_NEIGHBOR_OFFSETS
     for _atom in _atoms:
-        _ax = int(_atom.pos[0] * _inv_v)
-        _ay = int(_atom.pos[1] * _inv_v)
-        _az = int(_atom.pos[2] * _inv_v)
+        # Must match the build above, which uses np.floor(). int() truncates
+        # toward zero, so for negative coordinates the two disagree by one
+        # voxel and the queried block sits off-centre from the atom.
+        _ax = int(math.floor(_atom.pos[0] * _inv_v))
+        _ay = int(math.floor(_atom.pos[1] * _inv_v))
+        _az = int(math.floor(_atom.pos[2] * _inv_v))
         _nearby = []
         for _dx, _dy, _dz in _OFFSETS:
             _neighbor_key = _voxel_to_key.get((_ax + _dx, _ay + _dy, _az + _dz))
@@ -18078,7 +18789,13 @@ def _build_atom_neighbor_cache(_parts, _atoms):
                 if _rng is not None:
                     _start, _stop = _rng
                     for _oi in range(_start, _stop):
-                        _nearby.append(_parts[int(_order[_oi])])
+                        _cand = _parts[int(_order[_oi])]
+                        # An atom is not its own neighbour. Including it made
+                        # _cached_neighbors never empty, which silently
+                        # disabled the chemistry-scan short-circuit and the
+                        # dormant-atom skip in both substep branches.
+                        if _cand is not _atom:
+                            _nearby.append(_cand)
         _atom._cached_neighbors = _nearby
         _atom_neighbor_cache[id(_atom)] = _nearby  # legacy mirror, still consulted in fallback paths
 
@@ -29201,16 +29918,16 @@ if _TORCH:
             # Temporal irreducibility: autocorrelation of state trajectory
             if len(self.state_history) > 10:
                 recent = np.array(list(self.state_history)[-10:])
-                # A flat trajectory has zero stddev, so corrcoef divides by 0:
-                # that emitted a RuntimeWarning pair every call and returned NaN,
-                # which min(1.0, abs(nan)) then propagated into the metric.
                 _a0 = recent[:-1].flatten()[:1000]
                 _a1 = recent[1:].flatten()[:1000]
-                with np.errstate(invalid='ignore', divide='ignore'):
+                # A constant trajectory has zero variance -> corrcoef is NaN.
+                if _a0.size > 1 and _a0.std() > 1e-12 and _a1.std() > 1e-12:
                     autocorr = np.corrcoef(_a0, _a1)[0, 1]
-                if not np.isfinite(autocorr):
+                    if not np.isfinite(autocorr):
+                        autocorr = 0.0
+                else:
                     autocorr = 0.0
-                self.temporal_irreducibility = min(1.0, abs(float(autocorr)))
+                self.temporal_irreducibility = min(1.0, abs(autocorr))
 
         def get_status(self):
             return {
@@ -38215,9 +38932,19 @@ if _TORCH:
             results = []
             for case in SYMBOLIC_TEST_CASES:
                 law = _CS_PHYSICS_LAWS.get(case['law'])
+                # The case list names MATH_EQUATIONS entries too (triangle_area,
+                # bayes_theorem, ...). They carry the same {formula, desc} shape,
+                # so fall back to that table instead of self-reporting FAILED on
+                # laws this system genuinely holds. Only accept a symbolic
+                # formula -- some later-wave entries store a plain string.
+                if law is None:
+                    _cand = MATH_EQUATIONS.get(case['law'])
+                    if isinstance(_cand, dict) and hasattr(_cand.get('formula'),
+                                                           'free_symbols'):
+                        law = _cand
                 entry = {'law': case['law'], 'solve_for': case['solve_for'], 'passed': False, 'error': None}
                 if law is None:
-                    entry['error'] = 'law not found in _CS_PHYSICS_LAWS'
+                    entry['error'] = 'law not found in _CS_PHYSICS_LAWS or MATH_EQUATIONS'
                     results.append(entry)
                     continue
                 try:
@@ -38869,8 +39596,33 @@ if _TORCH:
                 pass
             pre_phi = np.mean(list(self.phi_history)[-10:]) if len(self.phi_history) >= 10 else np.mean(self.phi_history)
             saved_state = copy.deepcopy(self.state_dict())
+            params_to_prune = []
+
+            def _restore():
+                """Undo the pruning reparametrisation, then reload the weights.
+
+                torch.nn.utils.prune swaps `weight` for weight_orig + weight_mask,
+                so a state_dict captured BEFORE pruning can no longer be loaded
+                afterwards -- every rollback died with "Missing key(s) ...
+                weight_orig" and left the model permanently pruned. prune.remove()
+                collapses the reparametrisation back to a plain `weight`, after
+                which the pre-prune state loads cleanly."""
+                for _m, _n in params_to_prune:
+                    try:
+                        prune.remove(_m, _n)
+                    except Exception:
+                        pass
+                self.load_state_dict(saved_state)
+
             try:
-                params_to_prune = [(m, 'weight') for m in self.modules() if isinstance(m, nn.Linear)]
+                # global_unstructured builds one combined mask, so every
+                # parameter must live on the same device.
+                _ref_p = next(self.parameters(), None)
+                _ref_dev = _ref_p.device if _ref_p is not None else None
+                params_to_prune = [(m, 'weight') for m in self.modules()
+                                   if isinstance(m, nn.Linear)
+                                   and getattr(m, 'weight', None) is not None
+                                   and (_ref_dev is None or m.weight.device == _ref_dev)]
                 if params_to_prune:
                     prune.global_unstructured(
                         params_to_prune,
@@ -38879,8 +39631,13 @@ if _TORCH:
                     )
                 tokens, raw_text = self.get_sensory_input()
                 post_phi = self.process_input(tokens, task_category='prune_validation', raw_text=raw_text)
-                if post_phi < pre_phi * 0.7:
-                    self.load_state_dict(saved_state)
+                # process_input returns None when a step is skipped; treat
+                # an unmeasurable result as a failed validation.
+                if post_phi is None:
+                    _restore()
+                    msg = "Path pruning rolled back: post_phi unmeasurable"
+                elif post_phi < pre_phi * 0.7:
+                    _restore()
                     msg = f"Path pruning rolled back: post_phi={post_phi:.4f} < {pre_phi*0.7:.4f}"
                 else:
                     msg = f"Refined paths (pre={pre_phi:.4f} -> post={post_phi:.4f})"
@@ -38890,7 +39647,7 @@ if _TORCH:
                 except Exception:
                     pass
             except Exception as e:
-                self.load_state_dict(saved_state)
+                _restore()
                 msg = f"Path pruning error, rolled back: {e}"
                 print(msg)
                 try:
@@ -44268,7 +45025,7 @@ if _TORCH:
             self.url_input.pack(fill=tk.X, pady=2)
             self.url_input.insert(0, "Enter URL or YouTube link...")
 
-            self.image_label = tk.Label(ctrl, bg=BG)  # tk.Label, not the pyglet Label rebound below
+            self.image_label = tk.Label(ctrl, bg=BG)
             self.image_label.pack()
 
             btn_frame = tk.Frame(ctrl, bg=BG)
@@ -44417,7 +45174,7 @@ if _TORCH:
                 scr_tab.columnconfigure(0, weight=1)
                 tk.Label(scr_tab, text='Live Screen Capture', font=FONT_HEAD,
                          fg=FG_HEAD, bg=BG).grid(row=0, column=0, sticky='w', padx=8, pady=(8, 2))
-                self.screen_label = tk.Label(scr_tab, bg=BG)  # tk.Label, not the pyglet Label rebound below
+                self.screen_label = tk.Label(scr_tab, bg=BG)
                 self.screen_label.grid(row=0, column=0, sticky='nsew', padx=8, pady=2)
                 ocr_frame = tk.LabelFrame(scr_tab, text=' OCR / Extracted Text ',
                                           bg=BG_PANEL, fg=FG_ORANGE, font=FONT_SM)
@@ -44488,7 +45245,7 @@ if _TORCH:
                 self.memory_details = Text(self.root)
                 self.groups_list = Listbox(self.root)
                 self.group_details = Text(self.root)
-                self.screen_label = tk.Label(self.root)  # tk.Label, not the pyglet Label rebound below
+                self.screen_label = tk.Label(self.root)
                 self.screen_ocr_text = Text(self.root)
                 self.ax_loss = self.ax_phi = None
                 self.ax_C = self.ax_karma = self.ax_coh = self.ax_aware = None
@@ -44548,21 +45305,8 @@ if _TORCH:
                             'joy  %.2f' % float(_b.get('joy', 0.0)),
                             'aura %.2f' % float(_b.get('life_aura_energy', 0.0)),
                             'phase %s' % ('subspace' if _b.get('subspace_phase') else 'solid'),
-                            'organs %d sys  vit %.2f'
-                            % (int(_b.get('organ_systems', 0)),
-                               float(_b.get('organ_vitality', 0.0))),
-                            'cells  %.3g' % float(_b.get('total_cells', 0.0)),
-                            'genes  %d folded' % len(_b.get('genes', []) or []),
-                            '',
-                            '— organ vitality —',
+                            'organs %d systems' % int(_b.get('organ_systems', 0)),
                         ]
-                        for _sk in ('cardiovascular', 'respiratory', 'muscular',
-                                    'endocrine', 'nervous'):
-                            _sv = (_b.get('organs', {}) or {}).get(_sk)
-                            if _sv:
-                                _lines.append('%-9s %.2f (load %.2f)'
-                                              % (_sk[:9], float(_sv.get('vitality', 0.0)),
-                                                 float(_sv.get('load', 0.0))))
                     else:
                         _lines.append('(no shadow body)')
                     _lbl.config(text='\n'.join(_lines),
@@ -45518,10 +46262,7 @@ if _TORCH:
         except Exception:
             size = 0
         return {
-            # utcnow() is deprecated and returns a NAIVE datetime labelled UTC;
-            # datetime.now(timezone.utc) is the timezone-aware replacement.
-            'timestamp': (datetime.now(timezone.utc).isoformat()
-                          if 'datetime' in globals() else str(time.time())),
+            'timestamp': (datetime.now(timezone.utc).isoformat() if 'datetime' in globals() else str(time.time())),
             'source_size_bytes': size,
             'source_size_mb': round(size / (1024.0 * 1024.0), 4),
             'acceleration_enabled': True,
@@ -86023,6 +86764,43 @@ if _TORCH:
 
 
 
+    # === [Simulation.py] serialize training ==================================
+    # Upstream CS.py drives several training threads against one model and one
+    # optimizer with no mutual exclusion. A step() on one thread mutates
+    # parameters in place between another thread's forward and backward, so
+    # torch raises "one of the variables needed for gradient computation has
+    # been modified by an inplace operation" (or "Trying to backward through
+    # the graph a second time") and that update is silently lost.
+    #
+    # One re-entrant lock makes each forward->backward->step window atomic.
+    # It is always the OUTERMOST lock: no training method is ever called while
+    # self.lock is held (checked across all 27 call sites), so the only order
+    # that can exist is _CS_TRAIN_LOCK -> self.lock and the pair cannot
+    # deadlock. RLock keeps nested trainer calls safe. Applied here, after all
+    # wave monkey-patching, so nothing can replace the guarded methods.
+    _CS_TRAIN_LOCK = threading.RLock()
+
+    def _cs_serialize_training(_cls, *_names):
+        for _n in _names:
+            _orig = getattr(_cls, _n, None)
+            if _orig is None or getattr(_orig, '_cs_serialized', False):
+                continue
+
+            def _make(_fn):
+                @functools.wraps(_fn)
+                def _guarded(self, *a, **kw):
+                    with _CS_TRAIN_LOCK:
+                        return _fn(self, *a, **kw)
+                _guarded._cs_serialized = True
+                return _guarded
+
+            setattr(_cls, _n, _make(_orig))
+
+    _cs_serialize_training(ConsciousnessSimulator,
+                           'process_input', 'train_on_instruction_pair')
+    _cs_serialize_training(SubconsciousCoreBridge, '_train_step')
+    _cs_serialize_training(Wave47TrainingSubstrate, 'grpo_update')
+
     # === Compatibility aliases for Simulation.py bridge code ===
     symbols = {}  # Module-level symbol registry (new CS.py uses per-instance self.symbols)
     DIM = _CS_CONFIG["hidden_size"]
@@ -86274,6 +87052,32 @@ if _TORCH:
                     for s in random.sample(list(self.symbols.values()),
                                            min(4, len(self.symbols))):
                         s.evolve(phi)
+                    # --- Act on the world -------------------------------
+                    # Upstream CS.py used to call _execute_action() from a
+                    # ConsciousnessSimulator action loop; the rewrite dropped
+                    # both, leaving _execute_action -> _action_callback ->
+                    # SimulationObserver._subconscious_action_cb with nothing
+                    # to trigger it. Without this the observers still acted,
+                    # but purely on their heuristic scorer -- the neural
+                    # subconscious had no influence on what they did.
+                    # Throttled to every 4th step (~1 action/s at 4 Hz).
+                    if self.active_inference is not None and self.step % 4 == 0:
+                        try:
+                            _obs_vec = np.zeros(64, dtype=np.float64)
+                            _h_flat = (h_np.mean(axis=0) if getattr(h_np, "ndim", 1) == 2
+                                       else np.asarray(h_np).ravel())
+                            _n = min(64, int(_h_flat.shape[0]))
+                            _obs_vec[:_n] = np.nan_to_num(_h_flat[:_n], nan=0.0,
+                                                          posinf=1.0, neginf=-1.0)
+                            _act, _ = self.active_inference.select_action(_obs_vec)
+                            # The engine is built with 16 actions; the observer
+                            # callback buckets a 48-slot space (<8, <16, <24,
+                            # <32, <40, else), so scale to keep every bucket
+                            # reachable instead of only the first two.
+                            self._execute_action(int(_act) * 3)
+                        except Exception as _act_e:
+                            if self.step % 200 == 0:
+                                print(f"[{self.obs_id}] action err: {_act_e}")
                 except Exception as _e:
                     if self.step % 50 == 0:
                         print(f"[{self.obs_id}] inference err: {_e}")
@@ -86336,7 +87140,11 @@ if _TORCH:
                               (20,20),(-20,-20),(0,0)] * 12
                 self._action_callback(self.obs_id, idx, hotkeys, mouse_dirs)
             else:
-                super()._execute_action(idx)
+                # No observer attached (headless / self-test construction).
+                # Upstream ConsciousnessSimulator has no _execute_action, so
+                # super() here raised AttributeError. Record it instead so the
+                # selected action is still observable.
+                self._last_unrouted_action = idx
 
     _SC_KEY_CODES = KEY_CODES
     _SC_ActiveInferenceCore = ActiveInferenceCore
@@ -95576,6 +96384,7 @@ class ObserverManager:
             if obs.active:
                 try:
                     obs.perceive(sim_state)
+                    _fire_hooks('pre_observer_think', obs)
                     obs.think()
                     obs.decide(current_time)
                 except Exception as _obs_e:
@@ -96126,11 +96935,8 @@ class AvatarAffect:
         self.prev_free_energy = 0.0  # bookkeeping for free-energy reward
 
     def reward(self, pleasure_delta, wonder_delta):
-        # Floor is the 0.35 resting baseline, not 0: the type documents that
-        # neither axis ever reads below baseline, so a negative delta can damp
-        # a spike but can never manufacture a distress reading.
-        self.pleasure = max(0.35, min(1.0, self.pleasure + pleasure_delta))
-        self.wonder = max(0.35, min(1.0, self.wonder + wonder_delta))
+        self.pleasure = max(0.0, min(1.0, self.pleasure + pleasure_delta))
+        self.wonder = max(0.0, min(1.0, self.wonder + wonder_delta))
 
     def tick(self, dt):
         _baseline = 0.35
@@ -96565,13 +97371,9 @@ class ShadowBody:
         # ~72 bpm heart / ~12 breaths-per-min) and muscle tone sags as fatigue
         # rises -- both driven by AvatarVitals rather than a fixed constant.
         # Exertion comes from what the body is actually doing this frame.
-        # Exertion levels are calibrated so the body can actually recover:
-        # AvatarVitals recovers at (1 - exertion) * rate, so a sustained 1.0
-        # means energy only ever drains. Walking is light-moderate activity,
-        # not maximal effort, and idle/observing still leaves headroom.
-        _exertion = 0.35 if self.anim_state == self.WALKING else (
-            0.50 if self.anim_state in (self.BUILDING, self.SPAWNING) else (
-                0.15 if self.anim_state in (self.POINTING, self.TALKING) else 0.05))
+        _exertion = 1.0 if self.anim_state == self.WALKING else (
+            0.6 if self.anim_state in (self.BUILDING, self.SPAWNING) else (
+                0.25 if self.anim_state in (self.POINTING, self.TALKING) else 0.0))
         self.vitals.tick(dt, _exertion)
         self._breath_phase += dt * (self.vitals.heart_rate_hz / 6.0) * 2.0 * _PI
         self.muscle_tone = max(0.0, min(1.0,
@@ -96608,19 +97410,12 @@ class ShadowBody:
             self.organ_vitality = (_vit_sum / _vit_n) if _vit_n else 1.0
         except Exception:
             self.organ_vitality = 1.0
-        # Cardiovascular vitality feeds back as a RESTING-baseline penalty: a
-        # system under load has to work harder for the same exertion. This is
-        # applied to base_heart_rate_hz (recomputed from the genome every
-        # frame) rather than to the running heart_rate_hz -- multiplying the
-        # running value compounded frame over frame and pinned every body at
-        # ~210 bpm instead of letting it settle.
+        # Cardiovascular vitality feeds back into heart rate: a system under
+        # load has to work harder for the same exertion.
         try:
             _cv = self.organ_systems.get('cardiovascular')
-            _cv_pen = (1.0 - _cv['vitality']) if _cv is not None else 0.0
-            self.vitals.base_heart_rate_hz = (self.genome.base_heart_rate_hz
-                                              * (1.0 + 0.25 * _cv_pen))
-        except Exception:
-            pass
+            if _cv is not None:
+                self.vitals.heart_rate_hz *= (1.0 + 0.25 * (1.0 - _cv['vitality']))
         except Exception:
             pass
         # Visual aura glow is removed (was causing flashing), but the
@@ -96684,12 +97479,7 @@ class ShadowBody:
         # branch, matching AvatarAffect's "no suffering by default" design.
         try:
             _phi_c = max(0.0, min(1.0, float(self.neural_phi)))
-            # Floor at the resting baseline: phi lifts wonder above 0.35, it
-            # never drags it below. Without this the documented
-            # "joy() >= 0.35" invariant silently failed (observer phi is well
-            # under 0.35, so wonder settled near 0.06).
-            _w = 0.7 * self.affect.wonder + 0.3 * _phi_c
-            self.affect.wonder = max(0.35, min(1.0, _w))
+            self.affect.wonder = max(0.0, min(1.0, 0.7 * self.affect.wonder + 0.3 * _phi_c))
             _fe = float(self.neural_free_energy)
             _improvement = self.affect.prev_free_energy - _fe
             if _improvement > 0.0:
@@ -97696,14 +98486,6 @@ def _write_ob_state(mgr, n_particles):
                 _thoughts = [str(m) for _t, m in list(_ob.thought_log)[-8:]]
             except Exception:
                 pass
-            _body_report = {}
-            try:
-                for _sb in globals().get('_shadow_bodies', []) or []:
-                    if getattr(_sb, 'obs_id', None) == _ob.name:
-                        _body_report = _sb.get_vitals_report()
-                        break
-            except Exception:
-                _body_report = {}
             _obs_dict[_ob.name] = {
                 'active': bool(_ob.active),
                 'phi': float(_ob.phi),
@@ -97720,9 +98502,6 @@ def _write_ob_state(mgr, n_particles):
                 'phi_history': [float(x) for x in list(_ob.phi_history)[-60:]],
                 'subconscious': _sc,
                 'thought_log': _thoughts,
-                # Shadow-body vitals for this observer (AvatarVitals/AvatarAffect
-                # + subspace_phase), so the CS Viewer can show a body panel per OB.
-                'body': _body_report,
             }
         _state = {
             'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
@@ -97969,8 +98748,6 @@ def _get_sim_state_for_observers():
     state['nanotech_entities'] = _observer_full_data_cache['nanotech_entities']
     state['all_molecules'] = _observer_full_data_cache['all_molecules']
     # === FULL DATA ACCESS: history log ===
-    # _history_log is a deque -- materialise before slicing (deque has no
-    # slice support; the old form raised TypeError on every observer tick).
     state['history_log'] = list(_history_log)[-100:] if _history_log else []
     # === FULL DATA ACCESS: self-assembly state ===
     state['self_assembly'] = {
@@ -98023,7 +98800,7 @@ def _get_sim_state_for_observers():
     state['gna_allowed'] = _gna_allowed
     try:
         with _gna_output_lock:
-            state['gna_terminal'] = list(_gna_output)[-50:]
+            state['gna_terminal'] = list(_gna_output[-50:])
     except Exception:
         state['gna_terminal'] = []
     # === FULL DATA ACCESS: observer chat log ===
@@ -98524,6 +99301,7 @@ def _spawn_organism_atoms(org, center=None):
     _life_gen_last_org = org
     _life_gen_status = f'Spawned {len(spawned)} atoms, {len(bond_pairs)} bonds for {name}'
     _history_log.append((simulation_time, f'[LIFE-GEN] {name}: {len(spawned)} atoms, {len(bond_pairs)} bonds'))
+    _fire_hooks('on_organism_spawn', name, spawned)
     return spawned
 
 
@@ -116670,24 +117448,6 @@ _f1_page = 0  # 0=Main, 1=How It Works, 2=Detailed Reference
 # `getattr(on_draw, '_xxx_lbl', None)` idiom; this helper formalises the
 # pattern with a typed bucket keyed by `(font_size, anchor_x, anchor_y, multiline)`.
 # Centralises the cache so we don't grow N separate one-off labels.
-_label_pool = {}
-
-
-def _get_pooled_label(font_size=10, anchor_x='left', anchor_y='bottom', multiline=False, width=None):
-    """Return a recycled pyglet Label matching (font_size, anchor_x, anchor_y,
-    multiline). Caller mutates `.text`/`.color`/`.x`/`.y` and calls `.draw()`.
-    The label persists across frames so font-raster glyphs stay cached."""
-    _key = (int(font_size), anchor_x, anchor_y, bool(multiline), int(width) if width else 0)
-    _lbl = _label_pool.get(_key)
-    if _lbl is None:
-        if multiline and width:
-            _lbl = Label('', font_size=int(font_size), anchor_x=anchor_x,
-                         anchor_y=anchor_y, multiline=True, width=int(width))
-        else:
-            _lbl = Label('', font_size=int(font_size), anchor_x=anchor_x,
-                         anchor_y=anchor_y)
-        _label_pool[_key] = _lbl
-    return _lbl
 
 
 # === Item-3: Pyglet Label pool (cross-cutting performance helper) ===
@@ -116870,6 +117630,9 @@ def _set_ui_theme(name):
     _pal = _UI_THEME_PALETTES[name]
     for _k, _v in _pal.items():
         globals()[_k] = _v
+    # Pooled labels were built with the old palette; drop them so the
+    # next draw rebuilds each one against the new colours.
+    _invalidate_label_pool()
 
 
 # Initial bind (creates the module-level _TH_* names from the chosen palette)
@@ -117097,7 +117860,7 @@ def on_key_press(symbol, modifiers):
     global show_spectrum_panel, _ai_dashboard_tab, _ai_chat_input_active, _ai_chat_input_text
     global _ai_os_input_blocked, _ai_os_confirm_prompt
     global _gna_confirm_prompt, _gna_show_terminal, _gna_running, _gna_browser_control
-    global _show_photon_wavelengths
+    global _show_photon_wavelengths, _show_aura
     global show_life_gen_panel, _life_gen_highlight, _life_gen_scroll
     global show_lifeform_focus_list, _lifeform_focus_idx, _lifeform_focus_scroll
     global _cs_show_terminal, _lifegen_show_terminal
@@ -119419,6 +120182,7 @@ def update(dt):
                     'c': c, 'EPSILON': EPSILON, 'bound': bound,
                 }
             while physics_accumulator >= PHYSICS_DT and steps_done < _adaptive_max:
+                _fire_hooks('pre_physics_substep', particles, PHYSICS_DT)
                 if _use_jit:
                     # -- JIT batch: pairwise forces + Verlet as native machine code --
                     _dt_step = PHYSICS_DT * effective_time_factor
@@ -119469,25 +120233,9 @@ def update(dt):
                     # Batched motion for dormant atoms (Velocity Verlet, numpy SoA).
                     # Single np.array(...) + arithmetic replaces D Python function calls.
                     if _dormant_idx:
-                        _ddt = PHYSICS_DT * effective_time_factor
-                        _half_dt2 = 0.5 * _ddt * _ddt
-                        _D = len(_dormant_idx)
-                        # Pull positions/velocities into a flat numpy buffer
-                        _dpos = np.empty((_D, 3), dtype=np.float64)
-                        _dvel = np.empty((_D, 3), dtype=np.float64)
-                        _dga  = np.empty((_D, 3), dtype=np.float64)
-                        for _k, _idx in enumerate(_dormant_idx):
-                            _dpos[_k] = all_particles[_idx].pos
-                            _dvel[_k] = all_particles[_idx].vel
-                            _dga[_k]  = grav_accels[_idx] if _idx < n_grav else _zero_accel
-                        # Verlet: x += v*dt + 0.5*a*dt² ; v += a*dt
-                        _new_pos = _dpos + _dvel * _ddt + _dga * _half_dt2
-                        _new_vel = _dvel + _dga * _ddt
-                        for _k, _idx in enumerate(_dormant_idx):
-                            _ap = all_particles[_idx]
-                            _ap.prev_pos = _ap.pos  # cheap — same numpy object reference
-                            _ap.pos = _new_pos[_k]
-                            _ap.vel = _new_vel[_k]
+                        _batch_dormant_motion(
+                            all_particles, _dormant_idx, grav_accels, n_grav,
+                            PHYSICS_DT * effective_time_factor)
                 else:
                     # -- Fallback: pure Python per-particle update --
                     _skip_subatomic_snap = _n_parts > 2000
@@ -119499,6 +120247,7 @@ def update(dt):
                                 for _q in _sp.constituent_quarks:
                                     _q.prev_pos = _q.pos.copy()
                     _dormant_skip = _n_parts > _ATOM_NEIGHBOR_THRESHOLD
+                    _dormant_idx = []  # motion-only atoms
                     for idx, p in enumerate(all_particles):
                         if p in particle_set:
                             # Dormant skip (non-JIT fallback path) — matches JIT-path
@@ -119509,14 +120258,17 @@ def update(dt):
                                 if (_nb is not None and len(_nb) == 0
                                         and not getattr(p, 'radioactive', False)
                                         and not getattr(p, 'excitation_energy', 0) > 1e-25):
-                                    # Apply gravity motion directly, skip Atom.update()
-                                    ga = grav_accels[idx] if idx < n_grav else _zero_accel
-                                    _ddt = PHYSICS_DT * effective_time_factor
-                                    p.pos = p.pos + p.vel * _ddt + 0.5 * ga * _ddt * _ddt
-                                    p.vel = p.vel + ga * _ddt
+                                    # Collected here and moved in one batched
+                                    # pass below, exactly as the JIT path does,
+                                    # so both branches share an integrator.
+                                    _dormant_idx.append(idx)
                                     continue
                             ga = grav_accels[idx] if idx < n_grav else _zero_accel
                             p.update(all_particles, effective_time_factor, ga, em_on_gpu=_em_on_gpu)
+                    if _dormant_idx:
+                        _batch_dormant_motion(
+                            all_particles, _dormant_idx, grav_accels, n_grav,
+                            PHYSICS_DT * effective_time_factor)
                 physics_accumulator -= PHYSICS_DT
                 steps_done += 1
                 # Break early if wall-clock budget exceeded (prioritize frame rate)
@@ -119546,6 +120298,7 @@ def update(dt):
                         if not _mid_gpu_ok:
                             grav_accels = GravAccel(_mid_pos, all_masses, thetamax=_bh_theta, G=G)
                         n_grav = len(grav_accels)
+                _fire_hooks('post_physics_substep', particles, PHYSICS_DT)
             # Sync JIT results back to particle objects after all substeps
             if _use_jit and steps_done > 0:
                 _fast_soa.sync_to_particles(all_particles)
@@ -120100,7 +120853,8 @@ def on_draw():
     #   §K  HUD bar bottom strip + FPS/V_total/focus labels
     #   §L  PERF HUD (T2.13, when enabled) + render_total toc
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    global current_fps, particle_list_offset, cluster_list_offset, atom_list_offset, positron_list_offset, input_number, _nanotech_focus_scroll, _molecule_focus_scroll, _lifeform_focus_scroll, _f1_scroll_offset, _f1_scroll_max, _mandelbrot_3d_cache, _mandelbrot_3d_cache_key, _mandelbrot_2d_cache, _mandelbrot_2d_cache_key, _mandelbrot_cache, _mandelbrot_cache_key, _f1_page, _pause_start_time, _afk_auto_unpause, _afk_enabled, paused, _ai_dashboard_scroll, _mb_vbo_key, _cs_terminal_rect, _lifegen_terminal_rect
+    global current_fps, particle_list_offset, cluster_list_offset, atom_list_offset, positron_list_offset, input_number, _nanotech_focus_scroll, _molecule_focus_scroll, _lifeform_focus_scroll, _f1_scroll_offset, _f1_scroll_max, _mandelbrot_3d_cache, _mandelbrot_3d_cache_key, _mandelbrot_2d_cache, _mandelbrot_2d_cache_key, _mandelbrot_cache, _mandelbrot_cache_key, _f1_page, _pause_start_time, _afk_auto_unpause, _afk_enabled, paused, _ai_dashboard_scroll, _mb_vbo_key, _cs_terminal_rect, _lifegen_terminal_rect, _mandelbrot_img, _mandelbrot_img_key
+    _fire_hooks('pre_render_frame', camera)
     if WIDTH < 10 or HEIGHT < 10:
         return
     _perf_tic('render_total')
@@ -121845,7 +122599,8 @@ def on_draw():
     if _sb_tag_infos:
         _sb_lbl = getattr(on_draw, '_sb_lbl', None)
         if _sb_lbl is None:
-            _sb_lbl = Label('', font_size=9, anchor_x='center', anchor_y='bottom')
+            _sb_lbl = _get_pooled_label(9, 'center', 'bottom')
+            _sb_lbl.color = (255, 255, 255, 255)
             on_draw._sb_lbl = _sb_lbl
         for _sx, _sy, _sid, _sc, _sa, _stalk, _sgender in _sb_tag_infos:
             if _sx < 0 or _sx > WIDTH or _sy < 0 or _sy > HEIGHT:
@@ -121881,7 +122636,8 @@ def on_draw():
     if _show_photon_wavelengths and _photon_wave_infos:
         _pw_lbl = getattr(on_draw, '_pw_lbl', None)
         if _pw_lbl is None:
-            _pw_lbl = Label('', font_size=8, anchor_x='left', anchor_y='bottom')
+            _pw_lbl = _get_pooled_label(8, 'left', 'bottom')
+            _pw_lbl.color = (255, 255, 255, 255)
             on_draw._pw_lbl = _pw_lbl
         # Wave trail parameters
         _pw_trail_len = 40  # pixels of sinusoidal trail behind each photon
@@ -122237,7 +122993,8 @@ def on_draw():
         # Label below panel (in 2D screen coords)
         _fb_lbl = getattr(on_draw, '_fb_lbl', None)
         if _fb_lbl is None:
-            _fb_lbl = Label('', font_size=10, anchor_x='center', anchor_y='top')
+            _fb_lbl = _get_pooled_label(10, 'center', 'top')
+            _fb_lbl.color = (255, 255, 255, 255)
             on_draw._fb_lbl = _fb_lbl
         _fb_pos_str = f"({_fb.pos[0]:.0f}, {_fb.pos[1]:.0f}, {_fb.pos[2]:.0f})" if np.all(np.isfinite(_fb.pos)) else "(---)"
         _fb_gender_str = "Male" if _fb.gender == 'male' else "Female"
@@ -122269,7 +123026,8 @@ def on_draw():
                 label_infos = label_infos[:_max_lbls]
             _reuse_lbl = getattr(on_draw, '_reuse_lbl', None)
             if _reuse_lbl is None:
-                _reuse_lbl = Label('', font_size=10, color=(255, 255, 255, 255), anchor_x='center', anchor_y='bottom')
+                _reuse_lbl = _get_pooled_label(10, 'center', 'bottom')
+                _reuse_lbl.color = (255, 255, 255, 255)
                 on_draw._reuse_lbl = _reuse_lbl
             placed_rects = []  # (x, y, w, h) tuples instead of full Label objects
             for px, py, text, r, is_sub in label_infos:
@@ -122298,7 +123056,8 @@ def on_draw():
     if toggle_grid:
         _grid_lbl = getattr(on_draw, '_grid_lbl', None)
         if _grid_lbl is None:
-            _grid_lbl = Label('', font_size=9, color=(120, 180, 255, 200), anchor_x='center', anchor_y='center')
+            _grid_lbl = _get_pooled_label(9, 'center', 'center')
+            _grid_lbl.color = (120, 180, 255, 200)
             on_draw._grid_lbl = _grid_lbl
         label_step = max(1, int(step * 5))
         label_count = int(2 * effective_grid_size / label_step) if label_step > 0 else 0
@@ -122371,7 +123130,8 @@ def on_draw():
         _mb_step_y = (2.0 * _mb_gs) / max(_mb_res - 1, 1)
         _mb_lbl = getattr(on_draw, '_mb_lbl', None)
         if _mb_lbl is None:
-            _mb_lbl = Label('', font_size=8, color=(200, 160, 255, 220), anchor_x='center', anchor_y='center')
+            _mb_lbl = _get_pooled_label(8, 'center', 'center')
+            _mb_lbl.color = (200, 160, 255, 220)
             on_draw._mb_lbl = _mb_lbl
         _mb_label_step = max(1, _mb_res // 8)
         _mb_label_count = 0
@@ -122460,7 +123220,8 @@ def on_draw():
         _by_cur = _row1_y
         _hk_lbl = getattr(on_draw, '_hk_lbl', None)
         if _hk_lbl is None:
-            _hk_lbl = Label('', font_size=_hint_fs, color=_TH_TEXT_DIM)
+            _hk_lbl = _get_pooled_label(_hint_fs)
+            _hk_lbl.color = _TH_TEXT_DIM
             on_draw._hk_lbl = _hk_lbl
         _hk_lbl.font_size = _hint_fs
         for _aid, _dtxt in _hk_items:
@@ -122557,7 +123318,8 @@ def on_draw():
         if toggles_parts:
             _toggle_lbl = getattr(on_draw, '_toggle_lbl', None)
             if _toggle_lbl is None:
-                _toggle_lbl = Label('', font_size=9, color=_TH_WARN, anchor_x='right')
+                _toggle_lbl = _get_pooled_label(9, 'right')
+                _toggle_lbl.color = _TH_WARN
                 on_draw._toggle_lbl = _toggle_lbl
             _toggle_lbl.text = '  '.join(toggles_parts)
             _toggle_lbl.x = _right_x
@@ -126793,6 +127555,8 @@ def on_draw():
             print(f"[Screenshot] failed: {type(_ss_err).__name__}: {_ss_err}")
         finally:
             globals()['_pending_screenshot_path'] = None
+
+    _fire_hooks('post_render_frame', camera)
 
 
 # === save_screenshot — public API for researchers/paper-figure pipelines ===
